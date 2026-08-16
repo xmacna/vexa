@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+# XMACNA overlay for issue #524. The pinned upstream image supplies the complete,
+# multi-architecture Vexa v0.12 runtime; this layer rebuilds only the Google Meet
+# chat bridge and replaces the two Python API modules changed by the integration.
+FROM vexaai/vexa-lite:v0.12.22@sha256:de252fdc232f25803c339371be62ef1ba6b407d8f44913a16d0ae94da94178a4
+
+COPY core/meetings/modules/gmeet-capture/src/gmeet-chat.ts /app/core/meetings/modules/gmeet-capture/src/gmeet-chat.ts
+COPY core/meetings/modules/gmeet-capture/src/index.ts /app/core/meetings/modules/gmeet-capture/src/index.ts
+COPY core/meetings/services/bot/build-browser-utils.mjs /app/core/meetings/services/bot/build-browser-utils.mjs
+COPY core/meetings/services/bot/src/capture-bridge.ts /app/core/meetings/services/bot/src/capture-bridge.ts
+COPY core/meetings/services/bot/src/index.ts /app/core/meetings/services/bot/src/index.ts
+
+COPY core/gateway/services/gateway/src/gateway/app.py /app/core/gateway/services/gateway/src/gateway/app.py
+COPY core/meetings/services/meeting-api/src/meeting_api/app.py /app/core/meetings/services/meeting-api/src/meeting_api/app.py
+COPY core/meetings/services/meeting-api/src/meeting_api/collector/app.py /app/core/meetings/services/meeting-api/src/meeting_api/collector/app.py
+COPY core/meetings/services/meeting-api/src/meeting_api/lifecycle/chat_router.py /app/core/meetings/services/meeting-api/src/meeting_api/lifecycle/chat_router.py
+
+RUN cd /app/core/meetings/modules/gmeet-capture \
+ && /app/node_modules/.bin/tsc \
+ && cd /app/core/meetings/services/bot \
+ && /app/node_modules/.bin/tsc \
+ && node build-browser-utils.mjs \
+ && test -s /app/core/meetings/services/bot/dist/index.js \
+ && test -s /app/core/meetings/services/bot/dist/browser-utils.global.js \
+ && python3 -m py_compile \
+      /app/core/gateway/services/gateway/src/gateway/app.py \
+      /app/core/meetings/services/meeting-api/src/meeting_api/app.py \
+      /app/core/meetings/services/meeting-api/src/meeting_api/collector/app.py \
+      /app/core/meetings/services/meeting-api/src/meeting_api/lifecycle/chat_router.py
+
+LABEL org.opencontainers.image.source="https://github.com/xmacna/vexa" \
+      org.opencontainers.image.revision="480d34a3" \
+      ai.xmacna.issue="524"
