@@ -100,28 +100,41 @@ function deriveMaxActiveMs(inv: Invocation, everyoneLeftMs: number, env: NodeJS.
 
 /**
  * Tee an ActsSource so EVERY act reaches both the orchestrator (its single `handle`, which owns
- * `leave`) AND the bot's voice handler (speak / speak_stop), from ONE underlying subscription.
+ * `leave`) AND the bot's interactive handler (voice + chat), from ONE underlying subscription.
  * The orchestrator stays the pure core (it never imports the SpeakController); the voice path is
  * wired here at the composition root. The orchestrator's `subscribe(handler)` registers its
  * handler; we fan the live source's messages to it plus `voice`.
  */
-function teeActs(source: ActsSource, voice: (act: Act) => void | Promise<void>): ActsSource {
+function teeActs(source: ActsSource, interactive: (act: Act) => void | Promise<void>): ActsSource {
   return {
     subscribe(handler) {
       return source.subscribe((act) => {
         void Promise.resolve(handler(act)).catch((e) => console.error(`[bot] acts: orchestrator handler rejected: ${String(e)}`));
-        void Promise.resolve(voice(act)).catch((e) => console.error(`[bot] acts: voice handler rejected: ${String(e)}`));
+        void Promise.resolve(interactive(act)).catch((e) => console.error(`[bot] acts: interactive handler rejected: ${String(e)}`));
       });
     },
   };
 }
 
-/** The bot's voice-act handler: route acts.v1 speak / speak_stop to the SpeakController. The
- *  other voice acts (chat/screen/avatar) are out of this increment's scope. */
-function voiceHandler(speak: SpeakController): (act: Act) => Promise<void> {
+/** Route the interactive acts that belong to the browser composition root. Chat send is accepted
+ * only after the page-side adapter reads the bot's message back from Meet's DOM. */
+export function interactiveHandler(
+  speak: SpeakController,
+  page: Pick<BrowserSession['page'], 'evaluate'>,
+): (act: Act) => Promise<void> {
   return async (act) => {
     if (act.action === 'speak') await speak.speak(act.text, act.voice);
     else if (act.action === 'speak_stop') await speak.stop();
+    else if (act.action === 'chat_send') {
+      const result = await page.evaluate(async (text: string) => {
+        const chat = ((globalThis as any).__vexaGmeetChat);
+        if (!chat?.send) return { confirmed: false, reason: 'gmeet_chat_unavailable' };
+        return chat.send(text);
+      }, act.text);
+      if (!result?.confirmed) {
+        throw new Error(`chat_send was not confirmed: ${result?.reason ?? 'unknown_reason'}`);
+      }
+    }
   };
 }
 
@@ -275,9 +288,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
         console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
       },
     });
-    // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
+    // Interactive acts: voice reaches the SpeakController; chat reaches the confirmed Meet adapter.
     const speak = createSpeakController(session.page, inv);
-    acts = teeActs(liveActs, voiceHandler(speak));
+    acts = teeActs(liveActs, interactiveHandler(speak, session.page));
   } catch (e) {
     console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);
     join = noBrowserJoinDriver(String(e));

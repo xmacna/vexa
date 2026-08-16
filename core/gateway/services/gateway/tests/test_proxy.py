@@ -248,6 +248,14 @@ def test_native_chat_read_forwards_to_meeting_api():
     assert downstream.last["url"].endswith("/bots/google_meet/abc-defg-hij/chat")
 
 
+def test_native_chat_send_forwards_body_to_meeting_api():
+    client, downstream = _client()
+    r = client.post("/bots/google_meet/abc-defg-hij/chat", headers=AUTH, json={"text": "olá"})
+    assert r.status_code == 200
+    assert downstream.last["method"] == "POST"
+    assert downstream.last["url"].endswith("/bots/google_meet/abc-defg-hij/chat")
+
+
 def test_recording_download_alias_forwards_to_raw():
     """#579 C3: GET /recordings/{id}/media/{mid}/download aliases to the .../raw byte route."""
     client, downstream = _client()

@@ -1033,6 +1033,16 @@ export async function startCaptureBridge(
       }
       return;
     }
+    // gmeet chat is a sibling of audio capture: it emits remote messages through the same chat
+    // transcript sink and exposes a confirmed sender for acts.v1 chat_send. Failure to match Meet's
+    // accessibility surface is isolated from audio capture and reported by the command handler.
+    if (w.VexaBrowserUtils?.createGmeetChat && !w.__vexaGmeetChat) {
+      w.__vexaGmeetChat = w.VexaBrowserUtils.createGmeetChat({
+        botName,
+        log: (m: string) => w.logBot?.('[GmeetChat] ' + m),
+        onMessage: (m: { sender: string; text: string }) => w.__vexaChatMessage?.(m.sender, m.text),
+      });
+    }
     // gmeet lane: per-channel capture + glow attribution (the SAME module the extension runs).
     if (w.VexaBrowserUtils?.createGmeetCapture && !w.__vexaGmeetCapture) {
       w.__vexaGmeetSpeakers = w.__vexaGmeetSpeakers
@@ -1075,6 +1085,7 @@ export async function startCaptureBridge(
     await page.evaluate(() => {
       const w = (globalThis as any) as Record<string, any>;
       try { w.__vexaGmeetCapture?.stop?.(); } catch { /* best-effort */ }
+      try { w.__vexaGmeetChat?.destroy?.(); w.__vexaGmeetChat = null; } catch { /* best-effort */ }
       try { if (w.__vexaTeamsHealthTimer) { (globalThis as any).clearInterval(w.__vexaTeamsHealthTimer); w.__vexaTeamsHealthTimer = null; } } catch { /* */ }
       try { w.__vexaTeamsSpeakers?.destroy?.(); w.__vexaTeamsSpeakers = null; } catch { /* best-effort */ }
       // destroy() flushes a caption still mid-refinement as stable:false — the meeting's last

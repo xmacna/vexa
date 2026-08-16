@@ -64,6 +64,7 @@ const entryContents = `
 import {
   createGmeetCapture,
   createGmeetSpeakers,
+  createGmeetChat,
   createGmeetCaptureV1,
   pickBoundName,
   GmeetChannelBinder,
@@ -96,6 +97,7 @@ const VexaBrowserUtils = {
   // ── gmeet lane (per-participant capture + glow attribution) ──
   createGmeetCapture,        // capture-bridge.ts: w.VexaBrowserUtils.createGmeetCapture
   createGmeetSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createGmeetSpeakers (litNames())
+  createGmeetChat,           // capture-bridge.ts: incoming chat + confirmed chat send/readback
   createGmeetCaptureV1,      // the v1 producer (source-bound glow name)
   pickBoundName,
   GmeetChannelBinder,
@@ -158,7 +160,7 @@ await build({
 const bytes = fs.statSync(OUT).size;
 console.log(`✅ Browser utilities bundle created: ${OUT} (${bytes} bytes)`);
 console.log('📦 window.VexaBrowserUtils exposes:');
-console.log('  - createGmeetCapture / createGmeetSpeakers / createGmeetCaptureV1 / pickBoundName');
+console.log('  - createGmeetCapture / createGmeetSpeakers / createGmeetChat / createGmeetCaptureV1 / pickBoundName');
 console.log('  - GmeetChannelBinder / createPcmCaptureNode');
 console.log('  - createMixedAudioCapture / installRemoteAudioHook / selectTeamsMixStreams / createCsrcPoll');
 console.log('  - createJitsiSpeakers / createJitsiChat / sendJitsiChatMessage');

@@ -534,12 +534,8 @@ def build_router(
         })
 
     # --- GET /bots/{platform}/{native_meeting_id}/chat (#579 C3, sealed api.v1 ChatMessagesResponse).
-    # Thin HONEST restore: the route + owner boundary are real (unowned/unknown native → 404), but
-    # 0.12 does not PERSIST in-meeting chat server-side (chat frames flow live over the va:…:chat WS
-    # channel and are not stored), so the captured-message list is always empty until a chat-capture
-    # backend lands. The response conforms to the sealed shape; the empty list is the truthful state,
-    # not a fabricated one. The POST (send) half is a SIGNED GAP — see the PR (no bot-command backend
-    # in the 0.12 core). ---
+    # Chat messages are persisted as transcript.v1 segments with source="chat". Projecting those
+    # segments here keeps one durable timeline while preserving the sealed api.v1 chat shape.
     @router.get("/bots/{platform}/{native_meeting_id}/chat")
     async def read_meeting_chat(
         platform: str,
@@ -547,13 +543,31 @@ def build_router(
         x_user_id: Optional[str] = Header(default=None),
     ):
         user_id = _resolve_user_id(x_user_id)
-        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
-        if meeting_id is None:
+        document = await store.get_transcript(user_id, platform, native_meeting_id)
+        if document is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Meeting not found for platform {platform} and ID {native_meeting_id}",
             )
-        return JSONResponse(content={"messages": []})
+        messages = []
+        for segment in document.get("segments", []):
+            if segment.get("source") != "chat":
+                continue
+            timestamp = segment.get("start", 0.0)
+            absolute = segment.get("absolute_start_time")
+            if absolute:
+                try:
+                    from datetime import datetime
+                    timestamp = datetime.fromisoformat(absolute.replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    pass
+            messages.append({
+                "sender": segment.get("speaker") or "Unknown",
+                "text": segment.get("text", ""),
+                "timestamp": float(timestamp),
+                "is_from_bot": False,
+            })
+        return JSONResponse(content={"messages": messages})
 
     # --- POST /meetings/{platform}/{native_meeting_id}/workspace → BIND the meeting to a shared workspace
     # (meetings.data.workspace_id). Owner-scoped. Members of that workspace can then subscribe to this
