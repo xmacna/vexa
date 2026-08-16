@@ -38,6 +38,7 @@ from ..service_authority import (
 from .env_flags import env_flag
 from .invocation import build_invocation, build_workload_spec, mint_meeting_token
 from .ports import (
+    AssignmentTerminalConflict,
     AuthSessionBusy,
     AuthSessionNotConfigured,
     DuplicateMeeting,
@@ -51,7 +52,10 @@ from .ports import (
 
 # Re-exported here (defined in ports.py to avoid an adapters→service circular import) so callers that
 # already do ``from .service import DuplicateMeeting`` (the router) keep working.
-__all__ = ["request_bot", "construct_meeting_url", "DuplicateMeeting", "LOBBY_BUDGET_MS"]
+__all__ = [
+    "request_bot", "assignment_start_response", "construct_meeting_url", "DuplicateMeeting",
+    "LOBBY_BUDGET_MS",
+]
 
 # The waiting-room budget the control plane ISSUES to every bot it spawns (``automatic_leave
 # .waitingRoomTimeout``): how long the bot may sit in a lobby, silently polling, before it gives up
@@ -167,6 +171,13 @@ def _meeting_response(row: dict, *, sessions: Optional[list] = None) -> dict:
     }
 
 
+async def assignment_start_response(repo: MeetingRepo, reservation: dict) -> dict:
+    """Shape a validated ledger replay without consulting mutable spawn dependencies."""
+    row = reservation["meeting"]
+    sessions = await repo.list_sessions(meeting_id=row["id"])
+    return _meeting_response(row, sessions=sessions)
+
+
 async def request_bot(
     repo: MeetingRepo,
     runtime: RuntimeClient,
@@ -195,6 +206,9 @@ async def request_bot(
     webhook_url: Optional[str] = None,
     webhook_secret: Optional[str] = None,
     webhook_events: Optional[dict] = None,
+    assignment_id: Optional[str] = None,
+    assignment_request_hash: Optional[str] = None,
+    assignment_reservation: Optional[dict] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -342,46 +356,53 @@ async def request_bot(
     # meeting row but remain distinct delivered services and distinct billing
     # settlements. The admitted decision is frozen into meeting.data and
     # therefore travels with the terminal meeting projection.
-    connection_id = str(uuid.uuid4())
+    connection_id = (
+        assignment_reservation["connection_id"]
+        if assignment_reservation is not None
+        else assignment_id or str(uuid.uuid4())
+    )
     service_identity = f"meeting-session:{connection_id}"
-    active_concurrency = await repo.count_active_bots(
-        user_id=user_id,
-        exclude_meeting_id=(
-            reused_row["id"] if reused_row is not None else None
-        ),
-    )
-    if transcription_provider is None and authority.configured:
-        raise ServiceAuthorityUnavailable(
-            "configured service authority requires resolved service provenance"
+    if assignment_reservation is not None:
+        authority_record = dict(
+            assignment_reservation["meeting"].get("data", {}).get("service_authority") or {}
         )
-    authority_request = ServiceAuthorityRequest.admit(
-        user_id=user_id,
-        request_id=f"{service_identity}:admit",
-        service_identity=service_identity,
-        transcription_provider=transcription_provider or "none",
-        active_concurrency=active_concurrency,
-    )
-    authority_decision = await authority.decide(authority_request)
-    if (
-        authority_decision.enforced
-        and not authority_decision.allow
-    ):
-        raise ServiceAuthorityDenied(
-            authority_decision.reason,
-            authority_decision.decision_id,
+    else:
+        active_concurrency = await repo.count_active_bots(
+            user_id=user_id,
+            exclude_meeting_id=(
+                reused_row["id"] if reused_row is not None else None
+            ),
         )
-    authority_record = {
-        **authority_decision.to_record(),
-        "mode": authority.mode,
-        "service_mode": "bot",
-        "transcription_provider": authority_request.transcription_provider,
-        "lifecycle_contract_version":
-            authority_request.lifecycle_contract_version,
-        "last_boundary_at": None,
-        "last_decision_id": authority_decision.decision_id,
-        "teardown_confirmed": False,
-    }
+        if transcription_provider is None and authority.configured:
+            raise ServiceAuthorityUnavailable(
+                "configured service authority requires resolved service provenance"
+            )
+        authority_request = ServiceAuthorityRequest.admit(
+            user_id=user_id,
+            request_id=f"{service_identity}:admit",
+            service_identity=service_identity,
+            transcription_provider=transcription_provider or "none",
+            active_concurrency=active_concurrency,
+        )
+        authority_decision = await authority.decide(authority_request)
+        if authority_decision.enforced and not authority_decision.allow:
+            raise ServiceAuthorityDenied(
+                authority_decision.reason,
+                authority_decision.decision_id,
+            )
+        authority_record = {
+            **authority_decision.to_record(),
+            "mode": authority.mode,
+            "service_mode": "bot",
+            "transcription_provider": authority_request.transcription_provider,
+            "lifecycle_contract_version": authority_request.lifecycle_contract_version,
+            "last_boundary_at": None,
+            "last_decision_id": authority_decision.decision_id,
+            "teardown_confirmed": False,
+        }
 
+    reservation: Optional[dict] = None
+    assignment_replay = False
     if reused_row is not None:
         # continue_meeting reopens an EXISTING terminal row (no new active row inserted), so it is not
         # part of the fresh-insert TOCTOU window — but the per-user cap still applies (a continued run
@@ -431,13 +452,37 @@ async def request_bot(
             if webhook_events:
                 meeting_data["webhook_events"] = webhook_events
         try:
-            row = await repo.create_meeting_guarded(
-                user_id=user_id,
-                platform=platform,
-                native_meeting_id=native_meeting_id,
-                data=meeting_data,
-                max_concurrent=max_concurrent,
-            )
+            if assignment_id is not None:
+                if not assignment_request_hash:
+                    raise ValueError("assignment_request_hash is required with assignment_id")
+                reservation = assignment_reservation or await repo.reserve_assignment_start(
+                    assignment_id=assignment_id, user_id=user_id,
+                    request_hash=assignment_request_hash, platform=platform,
+                    native_meeting_id=native_meeting_id, data=meeting_data,
+                    max_concurrent=max_concurrent,
+                )
+                row = reservation["meeting"]
+                connection_id = reservation["connection_id"]
+                assignment_replay = bool(reservation["replay"])
+                if reservation["phase"] == "started":
+                    sessions = await repo.list_sessions(meeting_id=row["id"])
+                    response = _meeting_response(row, sessions=sessions)
+                    response["_assignment_replay"] = True
+                    return response
+                reservation = await repo.claim_assignment_launch(
+                    assignment_id=assignment_id,
+                    user_id=user_id,
+                    request_hash=assignment_request_hash,
+                )
+                row = reservation["meeting"]
+            else:
+                row = await repo.create_meeting_guarded(
+                    user_id=user_id,
+                    platform=platform,
+                    native_meeting_id=native_meeting_id,
+                    data=meeting_data,
+                    max_concurrent=max_concurrent,
+                )
         except MaxBotsExceeded:
             log_event(
                 "bot_spawn_max_bots_exceeded", audience="user", level="warning",
@@ -502,9 +547,16 @@ async def request_bot(
 
     # 5. Spawn over runtime.v1.
     spec = build_workload_spec(
-        workload_id=f"mtg-{meeting_id}-{connection_id[:8]}",
+        workload_id=(
+            reservation["workload_id"] if assignment_id is not None
+            else f"mtg-{meeting_id}-{connection_id[:8]}"
+        ),
         invocation=invocation,
         callback_url=f"{meeting_api_url}/runtime/callback",
+        extra_env=(
+            {"VEXA_WORKLOAD_CLAIM_HASH": assignment_request_hash}
+            if assignment_request_hash is not None else None
+        ),
     )
     try:
         result = await runtime.create_workload(spec)
@@ -515,6 +567,8 @@ async def request_bot(
         spawned_state = result.get("state")
         if spawned_state in ("stopped", "destroyed"):
             raise SpawnFailed(f"workload dead on spawn: {result.get('stopReason') or spawned_state}")
+        if assignment_id is not None and not result.get("startedAt"):
+            raise SpawnFailed("assignment workload acceptance is unconfirmed")
     except QuotaExceeded:
         log_event(
             "bot_spawn_quota_exceeded", audience="user", level="warning",
@@ -522,6 +576,35 @@ async def request_bot(
         )
         raise
     except SpawnFailed as e:
+        if assignment_id is not None:
+            # A synchronous failure may still have created an owned substrate object. Bind its
+            # immutable identity first; only an explicit absence of such identity is recorded as
+            # never-started and may return to retryable reserved without DELETE.
+            try:
+                teardown = await runtime.get_teardown_identity(reservation["workload_id"])
+            except Exception:
+                # Transport/registry uncertainty is not absence proof. Keep launching for the
+                # claim-bound reconciler; a blind retry could execute the assignment twice.
+                await repo.record_assignment_error(
+                    assignment_id=assignment_id, user_id=user_id,
+                    error_code="runtime_start_failed",
+                )
+            else:
+                if teardown.get("neverStarted") is True:
+                    await repo.release_assignment_launch(
+                        assignment_id=assignment_id, user_id=user_id,
+                        lease_token=reservation["lease_token"],
+                        error_code="runtime_start_failed", never_started=True,
+                    )
+                else:
+                    await repo.record_assignment_teardown_identity(
+                        assignment_id=assignment_id,
+                        lease_token=reservation["lease_token"],
+                        error_code="runtime_start_failed",
+                        teardown_backend=teardown["backend"],
+                        teardown_identity=teardown["identity"],
+                    )
+            raise
         # No workload came up. Mark the just-inserted meeting row `failed` with the reason so no
         # `requested` row lingers for the 5-minute reaper to flip reason-less (#718): the failure and
         # its cause are on the row NOW, and POST /bots answers 502 with the same reason. The row is
@@ -551,26 +634,77 @@ async def request_bot(
     #      ROB3. Wrap both DB writes: on failure, tear the just-created workload DOWN (best-effort) and
     #      re-raise as SpawnFailed so the route maps it to 502 and no half-spawned state is left behind.
     try:
-        # For a continued meeting this APPENDS a session to the reused row — N sessions per meeting (P3c).
-        await repo.create_session(meeting_id=meeting_id, session_uid=connection_id)
-        row = await repo.set_bot_container(meeting_id=meeting_id, bot_container_id=workload_id)
-    except Exception as e:  # noqa: BLE001 — any post-spawn DB failure must trigger compensation
+        if assignment_id is not None:
+            row = await repo.mark_assignment_started(
+                assignment_id=assignment_id,
+                user_id=user_id,
+                workload_id=workload_id,
+                lease_token=reservation["lease_token"],
+                started_at=result["startedAt"],
+            )
+        else:
+            # For a continued meeting this APPENDS a session to the reused row — N sessions per meeting (P3c).
+            await repo.create_session(meeting_id=meeting_id, session_uid=connection_id)
+            row = await repo.set_bot_container(meeting_id=meeting_id, bot_container_id=workload_id)
+    except AssignmentTerminalConflict:
+        # Fence terminalization before teardown so neither this worker nor a stale lease can later
+        # publish started.  A failed teardown intentionally leaves cancel_pending for recovery.
+        teardown = await runtime.get_teardown_identity(workload_id)
+        cancel = await repo.begin_assignment_cancel(
+            assignment_id=assignment_id,
+            lease_token=reservation["lease_token"],
+            error_code="meeting_terminal",
+            teardown_backend=teardown["backend"],
+            teardown_identity=teardown["identity"],
+        )
         try:
-            await runtime.delete_workload(workload_id)
-        except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the cause
+            await runtime.delete_workload_attested(
+                workload_id,
+                backend=teardown["backend"],
+                identity=teardown["identity"],
+                claim_hash=assignment_request_hash,
+            )
+        except Exception as teardown_err:  # noqa: BLE001
             log_event(
-                "bot_spawn_orphan_teardown_failed", audience="system", level="error",
+                "bot_spawn_terminal_race_teardown_failed", audience="system", level="error",
                 span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
                 fields={"workload_id": workload_id, "error": str(teardown_err)},
+            )
+            raise SpawnFailed(
+                "assignment became terminal but workload teardown is unconfirmed"
+            ) from teardown_err
+        await repo.record_assignment_teardown(
+            assignment_id=assignment_id,
+            lease_token=cancel["lease_token"],
+        )
+        await repo.complete_assignment_cancel(
+            assignment_id=assignment_id,
+            lease_token=cancel["lease_token"],
+        )
+        raise
+    except Exception as e:  # noqa: BLE001 — any post-spawn DB failure must trigger compensation
+        if assignment_id is None:
+            try:
+                await runtime.delete_workload(workload_id)
+            except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the cause
+                log_event(
+                    "bot_spawn_orphan_teardown_failed", audience="system", level="error",
+                    span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                    fields={"workload_id": workload_id, "error": str(teardown_err)},
+                )
+        else:
+            await repo.record_assignment_error(
+                assignment_id=assignment_id,
+                user_id=user_id,
+                error_code="finalize_failed",
             )
         log_event(
             "bot_spawn_post_spawn_db_failed", audience="system", level="error",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
             fields={"workload_id": workload_id, "error": str(e)},
         )
-        raise SpawnFailed(
-            f"post-spawn DB write failed; workload {workload_id} torn down"
-        ) from e
+        action = "torn down" if assignment_id is None else "left reserved for exact retry"
+        raise SpawnFailed(f"post-spawn DB write failed; workload {workload_id} {action}") from e
 
     # Reconcile a stop that RACED the spawn (the spawn/stop design-gap fix): if a DELETE marked this
     # meeting stopping/terminal while the workload was being created, tear the just-spawned workload down
@@ -601,4 +735,7 @@ async def request_bot(
             "continued": reused_row is not None, "session_count": len(sessions),
         },
     )
-    return _meeting_response(row, sessions=sessions)
+    response = _meeting_response(row, sessions=sessions)
+    if assignment_id is not None:
+        response["_assignment_replay"] = assignment_replay
+    return response

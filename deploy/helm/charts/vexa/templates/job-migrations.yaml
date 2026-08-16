@@ -15,10 +15,8 @@ metadata:
   # (including postgres-credentials) are not yet created when pre-install
   # hooks run — migrations would crash with "secret postgres-credentials
   # not found." Discovered during v0.10.5 helm-mode validate (this cycle).
-  # On first install, the Job runs as a regular managed resource AFTER
-  # secrets are deployed; on upgrade, the hook prevents the immutable-
-  # patch error. This is the standard Helm idiom for migration Jobs that
-  # depend on chart-managed secrets.
+  # First-install ordering is provided by meeting-api's migration initContainer, which runs only
+  # after the chart-managed secret exists. Upgrades use this hook before any new Deployment Pod.
   annotations:
     "helm.sh/hook": pre-upgrade
     "helm.sh/hook-weight": "0"
@@ -50,7 +48,7 @@ spec:
             - |
               set -e
               echo "Running idempotent schema sync..."
-              python -c "import asyncio; from meeting_api.database import init_db; asyncio.run(init_db()); print('Schema sync complete.')"
+              python -m meeting_api.database
           env:
             - name: DB_HOST
               value: {{ include "vexa.dbHostEffective" . | quote }}

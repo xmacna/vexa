@@ -14,6 +14,8 @@ would contain `--command -- /app/vexa-bot/entrypoint.sh` and the assertions belo
 """
 from __future__ import annotations
 
+import json
+
 import runtime_kernel.k8s_backend as k8s_backend
 from runtime_kernel import default_registry
 from runtime_kernel.k8s_backend import K8sBackend
@@ -29,7 +31,12 @@ def _capture_run_argv(monkeypatch) -> list:
 
         class _R:
             returncode = 0
-            stdout = ""
+            stdout = json.dumps({"metadata": {}, "status": {
+                "phase": "Running",
+                "containerStatuses": [{"state": {"running": {
+                    "startedAt": "2026-06-20T09:00:01Z",
+                }}}],
+            }})
             stderr = ""
 
         return _R()

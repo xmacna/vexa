@@ -208,6 +208,7 @@ def build_production_app():
         system_webhook_sink=system_webhook_sink,
         session_factory=session_factory,
         storage=storage,
+        engine=engine,
     )
     return app
 
@@ -224,6 +225,7 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
+    engine=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
 
@@ -408,6 +410,7 @@ def _attach_background_loops(
             return
         from .lifecycle.machine import TransitionSource as _TS
         from .lifecycle.reconcile import (
+            reconcile_assignment_start_sweep,
             reconcile_stale_nonterminal_sweep,
             reconcile_stale_stopping_sweep,
         )
@@ -434,6 +437,9 @@ def _attach_background_loops(
         has_general = hasattr(meeting_repo, "list_stale_nonterminal")
 
         async def _tick():
+            await reconcile_assignment_start_sweep(
+                meeting_repo, runtime, _post_lifecycle, log=log,
+            )
             if has_general:
                 await reconcile_stale_nonterminal_sweep(
                     meeting_repo, runtime, _post_lifecycle,
@@ -640,6 +646,12 @@ def _attach_background_loops(
 
     @asynccontextmanager
     async def lifespan(_app):
+        if engine is not None:
+            from .database import verify_assignment_schema
+
+            # A missing/skewed release migration is a startup failure, never a partially serving
+            # API whose first assignment request crashes with undefined_table.
+            await verify_assignment_schema(engine)
         tasks = [
             asyncio.create_task(_segment_consumer_loop(), name="segment-consumer"),
             asyncio.create_task(_db_writer_loop(), name="db-writer"),

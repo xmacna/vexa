@@ -330,10 +330,10 @@ dashboard:
     limits:   { cpu: 500m, memory: 1Gi }
   extraEnv: []
 
-# Optional idempotent schema-sync Job (meeting-api owns init_db). Off by default; the services
-# create their schema on boot. Enable for an explicit pre-upgrade migration gate.
+# Release-gated assignment-ledger migration. The pre-upgrade Job runs before new Deployments; the
+# meeting-api initContainer covers first install. The app independently verifies the schema.
 migrations:
-  enabled: false
+  enabled: true
   backoffLimit: 3
   image:
     repository: ""

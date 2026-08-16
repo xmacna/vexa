@@ -87,6 +87,82 @@ class MeetingRepo(Protocol):
         ``create_meeting`` pre-check sequence on the fresh-insert path."""
         ...
 
+    async def reserve_assignment_start(
+        self,
+        *,
+        assignment_id: str,
+        user_id: int,
+        request_hash: str,
+        platform: str,
+        native_meeting_id: str,
+        data: dict,
+        max_concurrent: Optional[int] = None,
+    ) -> dict:
+        """Atomically reserve an assignment, meeting, session and deterministic workload identity."""
+        ...
+
+    async def get_assignment_start(
+        self, *, assignment_id: str, user_id: int, request_hash: str
+    ) -> Optional[dict]:
+        """Read and validate an existing assignment before any mutable dependency call."""
+        ...
+
+    async def claim_assignment_launch(
+        self, *, assignment_id: str, user_id: int, request_hash: str
+    ) -> dict:
+        """Lease the external launch; only one replica may create for an assignment at a time."""
+        ...
+
+    async def release_assignment_launch(
+        self, *, assignment_id: str, user_id: int, lease_token: str, error_code: str,
+        never_started: bool = False,
+    ) -> None:
+        """CAS a proven pre-start failure back to retryable reserved."""
+        ...
+
+    async def claim_assignment_reconcile_candidates(self, *, limit: int = 20) -> list[dict]:
+        """Lease expired operational rows with SKIP LOCKED; no network occurs in the transaction."""
+        ...
+
+    async def begin_assignment_cancel(
+        self, *, assignment_id: str, lease_token: str, error_code: str,
+        teardown_backend: str, teardown_identity: str,
+    ) -> dict:
+        """Fence launching→cancel_pending before any teardown."""
+        ...
+
+    async def record_assignment_teardown_identity(
+        self, *, assignment_id: str, lease_token: str, error_code: str,
+        teardown_backend: str, teardown_identity: str,
+    ) -> dict:
+        """Persist the immutable substrate handle before a launching-phase teardown."""
+        ...
+
+    async def complete_assignment_cancel(
+        self, *, assignment_id: str, lease_token: str
+    ) -> None:
+        """CAS cancel_pending→cancelled only after lifecycle and teardown confirmation."""
+        ...
+
+    async def record_assignment_teardown(
+        self, *, assignment_id: str, lease_token: str
+    ) -> None:
+        """Persist positive substrate teardown proof before the fallible lifecycle callback."""
+        ...
+
+    async def mark_assignment_started(
+        self, *, assignment_id: str, user_id: int, workload_id: str,
+        lease_token: str, started_at: str,
+    ) -> dict:
+        """Bind the workload and advance reserved→started idempotently."""
+        ...
+
+    async def record_assignment_error(
+        self, *, assignment_id: str, user_id: int, error_code: str
+    ) -> None:
+        """Record only a bounded non-secret error code; the reservation remains retryable."""
+        ...
+
     async def reopen_meeting(
         self, *, meeting_id: int, data_patch: Optional[dict] = None
     ) -> dict:
@@ -232,6 +308,20 @@ class RuntimeClient(Protocol):
         ``running`` workload, so it is never reaped on silence alone."""
         ...
 
+    async def get_teardown_identity(self, workload_id: str) -> dict:
+        """Return the runtime-attested immutable Docker ID / Kubernetes UID."""
+        ...
+
+    async def probe_claimed_workload(self, workload_id: str, *, claim_hash: str) -> dict:
+        """Stateless substrate proof for an assignment after runtime registry loss."""
+        ...
+
+    async def delete_workload_attested(
+        self, workload_id: str, *, backend: str, identity: str, claim_hash: str,
+    ) -> None:
+        """Delete or prove absence/replacement of exactly the persisted immutable identity."""
+        ...
+
 
 class QuotaExceeded(Exception):
     """The runtime kernel rejected the spawn for owner quota (429) — surfaced as HTTP 429.
@@ -310,6 +400,30 @@ class DuplicateMeeting(Exception):
     Raised by ``MeetingRepo.create_meeting_guarded`` (the atomic dedup) — either because the in-txn
     dedup query found an active row, or because the unique partial index on active rows rejected the
     concurrent insert (the DB-level backstop). Re-exported from ``service`` for the router's mapping."""
+
+
+class AssignmentPayloadConflict(Exception):
+    """An assignment was already bound to a different canonical public start request."""
+
+
+class AssignmentOwnerConflict(Exception):
+    """An assignment id is already bound to a different authenticated user."""
+
+
+class AssignmentTerminalConflict(Exception):
+    """The bound meeting became terminal before the workload acceptance CAS committed."""
+
+
+class AssignmentInProgress(Exception):
+    """Another replica owns a non-expired assignment launch lease."""
+
+
+class AssignmentLeaseLost(Exception):
+    """A stale worker attempted to finalize after its launch lease was replaced."""
+
+
+class AssignmentLifecycleUnconfirmed(Exception):
+    """Teardown completed but the meeting's terminal lifecycle state is not durable yet."""
 
 
 # Statuses in which the bot has NOT yet reached the meeting. Their row goes quiet by DESIGN — a bot

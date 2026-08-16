@@ -330,6 +330,12 @@ def create_app(
     async def create_bot(request: Request):
         return await _forward("POST", _meeting("/bots"), request)
 
+    @app.put("/bots/assignments/{assignment_id}")
+    async def ensure_assignment_started(assignment_id: str, request: Request):
+        return await _forward(
+            "PUT", _meeting(f"/bots/assignments/{assignment_id}"), request,
+        )
+
     @app.get("/bots/status")
     async def bots_status(request: Request):
         return await _forward("GET", _meeting("/bots/status"), request)

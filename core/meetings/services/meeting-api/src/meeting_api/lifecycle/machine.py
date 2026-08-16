@@ -13,6 +13,7 @@ rejecting illegal transitions and recording terminal attribution.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -272,6 +273,17 @@ class MeetingStore:
             rec = MeetingRecord(connection_id=connection_id)
             self._records[connection_id] = rec
         return rec
+
+    def snapshot(self, connection_id: str) -> Optional[MeetingRecord]:
+        """Copy one record so a failed durable write can roll back an optimistic FSM advance."""
+        record = self._records.get(connection_id)
+        return deepcopy(record) if record is not None else None
+
+    def restore(self, connection_id: str, snapshot: Optional[MeetingRecord]) -> None:
+        if snapshot is None:
+            self._records.pop(connection_id, None)
+        else:
+            self._records[connection_id] = snapshot
 
     def rehydrate(
         self,

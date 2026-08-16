@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
-from ..bot_spawn.ports import WorkloadUnknown
+from ..bot_spawn.ports import AssignmentLifecycleUnconfirmed, WorkloadUnknown
 
 
 async def _teardown_verdict(
@@ -386,6 +386,174 @@ async def reconcile_stale_nonterminal_sweep(
     # stale), or it was reconciled — drops its tracker entry. Only CONTINUOUS untracked escalates.
     for mid in [m for m in tracker if m not in seen_untracked]:
         tracker.pop(mid, None)
+    return reconciled
+
+
+async def reconcile_assignment_start_sweep(
+    repo: Any,
+    runtime: Any,
+    post_lifecycle: Callable[[dict], Awaitable[Any]],
+    *,
+    log: Any,
+    limit: int = 20,
+) -> int:
+    """Recover assignment starts with short PG leases and no network inside transactions.
+
+    A pre-launch reservation expires safely without touching the substrate. A launching row is never
+    respawned by the sweeper: exact runtime proof finalizes it, while a proven pre-start failure moves
+    through cancel_pending and requires confirmed teardown plus the normal lifecycle callback. Runtime
+    404/unavailability remains pending because registry absence is not substrate absence.
+    """
+    if not hasattr(repo, "claim_assignment_reconcile_candidates"):
+        return 0
+    candidates = await repo.claim_assignment_reconcile_candidates(limit=limit)
+    reconciled = 0
+    for row in candidates:
+        phase = row["phase"]
+        workload = None
+        stateless_proof = None
+        if phase == "launching":
+            # A request-path failure may already have bound the immutable handle before crashing.
+            # Reconfirm/delete that exact owned object without relying on the restarted registry.
+            if row.get("teardown_identity") and row.get("last_error_code") == "runtime_start_failed":
+                try:
+                    await runtime.delete_workload_attested(
+                        row["workload_id"], backend=row["teardown_backend"],
+                        identity=row["teardown_identity"], claim_hash=row["request_hash"],
+                    )
+                except Exception:
+                    log.error("assignment-reconcile: teardown unconfirmed for %s", row["assignment_id"])
+                    continue
+                await repo.release_assignment_launch(
+                    assignment_id=row["assignment_id"], user_id=row["user_id"],
+                    lease_token=row["lease_token"], error_code="runtime_start_failed",
+                )
+                reconciled += 1
+                continue
+            try:
+                workload = await runtime.get_workload(row["workload_id"])
+            except Exception:
+                log.warning("assignment-reconcile: runtime proof unavailable for %s", row["assignment_id"])
+                continue
+            if workload is None:
+                try:
+                    proof = await runtime.probe_claimed_workload(
+                        row["workload_id"], claim_hash=row["request_hash"],
+                    )
+                except Exception:
+                    log.warning(
+                        "assignment-reconcile: stateless substrate proof unavailable for %s",
+                        row["assignment_id"],
+                    )
+                    continue
+                if proof.get("neverStarted") is True:
+                    await repo.release_assignment_launch(
+                        assignment_id=row["assignment_id"], user_id=row["user_id"],
+                        lease_token=row["lease_token"], error_code="runtime_start_failed",
+                        never_started=True,
+                    )
+                    reconciled += 1
+                    continue
+                stateless_proof = proof
+                workload = proof
+            if (
+                workload is not None
+                and workload.get("state") in ("running", "stopped", "destroyed")
+                and workload.get("startedAt")
+            ):
+                await repo.mark_assignment_started(
+                    assignment_id=row["assignment_id"],
+                    user_id=row["user_id"],
+                    workload_id=row["workload_id"],
+                    lease_token=row["lease_token"],
+                    started_at=workload["startedAt"],
+                )
+                reconciled += 1
+                continue
+            owned_prestart = (
+                stateless_proof is not None
+                and bool(stateless_proof.get("identity"))
+                and not stateless_proof.get("startedAt")
+                and stateless_proof.get("state") in ("starting", "running", "stopped", "destroyed")
+            )
+            if not (owned_prestart or (
+                workload is not None
+                and workload.get("state") in ("stopped", "destroyed")
+                and not workload.get("startedAt")
+            )):
+                continue
+            if stateless_proof is not None:
+                teardown = {
+                    "backend": stateless_proof["backend"],
+                    "identity": stateless_proof["identity"],
+                }
+            else:
+                try:
+                    teardown = await runtime.get_teardown_identity(row["workload_id"])
+                except Exception:
+                    log.error(
+                        "assignment-reconcile: immutable teardown identity unavailable for %s",
+                        row["assignment_id"],
+                    )
+                    continue
+            if teardown.get("neverStarted") is True:
+                await repo.release_assignment_launch(
+                    assignment_id=row["assignment_id"], user_id=row["user_id"],
+                    lease_token=row["lease_token"], error_code="runtime_start_failed",
+                    never_started=True,
+                )
+                reconciled += 1
+                continue
+            row = await repo.begin_assignment_cancel(
+                assignment_id=row["assignment_id"],
+                lease_token=row["lease_token"],
+                error_code="runtime_start_failed",
+                teardown_backend=teardown["backend"],
+                teardown_identity=teardown["identity"],
+            )
+            phase = "cancel_pending"
+
+        if phase != "cancel_pending":
+            continue
+        # launch_attempt=0 is a DB proof that no runtime create was ever authorized.
+        if row.get("teardown_confirmed_at") is None and int(row.get("launch_attempt") or 0) > 0:
+            try:
+                await runtime.delete_workload_attested(
+                    row["workload_id"],
+                    backend=row["teardown_backend"],
+                    identity=row["teardown_identity"],
+                    claim_hash=row["request_hash"],
+                )
+            except Exception:
+                log.error(
+                    "assignment-reconcile: teardown unconfirmed for %s; keeping cancel_pending",
+                    row["assignment_id"],
+                )
+                continue
+        if row.get("teardown_confirmed_at") is None:
+            await repo.record_assignment_teardown(
+                assignment_id=row["assignment_id"],
+                lease_token=row["lease_token"],
+            )
+        await post_lifecycle({
+            "connection_id": row["connection_id"],
+            "status": "failed",
+            "completion_reason": "start_failed",
+            "reason": "assignment start was cancelled before accepted substrate proof",
+        })
+        try:
+            await repo.complete_assignment_cancel(
+                assignment_id=row["assignment_id"],
+                lease_token=row["lease_token"],
+            )
+        except AssignmentLifecycleUnconfirmed:
+            log.error(
+                "assignment-reconcile: lifecycle persistence unconfirmed for %s; "
+                "keeping cancel_pending",
+                row["assignment_id"],
+            )
+            continue
+        reconciled += 1
     return reconciled
 
 

@@ -452,6 +452,7 @@ def _mount_lifecycle(
                         persisted.get("status"),
                         persisted.get("data"),
                     )
+        snapshot = sink.store.snapshot(connection_id) if connection_id else None
         change = None
         try:
             change = sink.apply_change(
@@ -480,6 +481,7 @@ def _mount_lifecycle(
                     persisted.get("data"),
                     replace_stale=True,
                 )
+                snapshot = sink.store.snapshot(connection_id)
                 try:
                     change = sink.apply_change(
                         body,
@@ -506,12 +508,10 @@ def _mount_lifecycle(
         # set only on a real persist), so end-user delivery is exactly-once; this keeps the in-process
         # envelope log honest too.
         envelope = None
-        if not change.no_op:
-            envelope = build_status_change_envelope(change)
-            app.state.status_change_webhooks.append(envelope)
         # Persist the FSM advance to the DB meeting row → durable + queryable (GET /meetings reflects
-        # it, survives a restart), not only the in-process MeetingStore. Best-effort: a DB hiccup must
-        # never fail the bot's lifecycle callback (the in-process FSM + webhook already advanced).
+        # it, survives a restart), not only the in-process MeetingStore. The in-memory advance is
+        # optimistic until this write succeeds; on failure restore the snapshot and return retryable
+        # 503 so a same-process redelivery cannot be mistaken for an already-persisted no-op.
         # On an idempotent replay (change.no_op) the FSM did not actually advance — skip the
         # re-persist + re-deliver so a redelivered terminal does not fire a duplicate webhook /
         # publish. We still return 200 (handled below) — the redelivery is acknowledged as a no-op.
@@ -525,9 +525,24 @@ def _mount_lifecycle(
                     failure_stage=rec.failure_stage.value if rec.failure_stage else None,
                     data=rec.data if isinstance(rec.data, dict) else None,
                 )
-            except Exception as e:  # noqa: BLE001 — persistence is best-effort
+                if not isinstance(meeting_row, dict):
+                    raise RuntimeError("lifecycle persistence returned no durable meeting row")
+            except Exception as e:  # noqa: BLE001 — rollback makes a same-process retry real
+                if connection_id:
+                    sink.store.restore(connection_id, snapshot)
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
                           span="lifecycle.callback", fields={"error": str(e)})
+                return (
+                    503,
+                    {
+                        "status": "error",
+                        "detail": "lifecycle persistence is temporarily unavailable",
+                        "connection_id": connection_id,
+                    },
+                )
+        if not change.no_op:
+            envelope = build_status_change_envelope(change)
+            app.state.status_change_webhooks.append(envelope)
         # COMPLETION FINALIZATION — the moment the FSM lands on a terminal status, flush the
         # meeting's remaining live redis segments to the durable store (threshold 0: the mutable
         # tail included, no more updates are coming) and persist the processed doc into

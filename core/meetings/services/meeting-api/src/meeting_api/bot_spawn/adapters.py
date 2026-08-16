@@ -16,6 +16,8 @@ from typing import Optional
 
 from ..sessions import new_session
 from .ports import (
+    AssignmentOwnerConflict,
+    AssignmentPayloadConflict,
     DuplicateMeeting,
     MaxBotsExceeded,
     QuotaExceeded,
@@ -77,7 +79,7 @@ class SqlAlchemyMeetingRepo:
         self._session_factory = session_factory
 
     async def find_active(self, user_id, platform, native_meeting_id) -> Optional[dict]:
-        from sqlalchemy import select
+        from sqlalchemy import select, text
 
         from ..sessions.models import Meeting
 
@@ -96,7 +98,7 @@ class SqlAlchemyMeetingRepo:
             return _row_to_dict(m) if m else None
 
     async def find_active_by_userdata(self, userdata_s3_path) -> Optional[dict]:
-        from sqlalchemy import select
+        from sqlalchemy import or_, select
 
         from ..sessions.models import Meeting
 
@@ -162,7 +164,7 @@ class SqlAlchemyMeetingRepo:
     async def get_status_by_session(self, *, session_uid) -> Optional[str]:
         from sqlalchemy import select
 
-        from ..sessions.models import Meeting, MeetingSession
+        from ..sessions.models import BotStartRequest, Meeting, MeetingSession
 
         async with self._session_factory() as db:
             sess = (
@@ -363,9 +365,9 @@ class SqlAlchemyMeetingRepo:
         the LATEST session_uid per meeting (mirrors ``list_stale_stopping``)."""
         from datetime import datetime, timezone
 
-        from sqlalchemy import select
+        from sqlalchemy import or_, select
 
-        from ..sessions.models import Meeting, MeetingSession
+        from ..sessions.models import BotStartRequest, Meeting, MeetingSession
 
         non_terminal = [
             "requested", "joining", "awaiting_admission", "needs_help", "active", "stopping",
@@ -376,7 +378,14 @@ class SqlAlchemyMeetingRepo:
                     select(Meeting.id, Meeting.status, Meeting.updated_at,
                            MeetingSession.session_uid, Meeting.bot_container_id, Meeting.data)
                     .join(MeetingSession, MeetingSession.meeting_id == Meeting.id)
-                    .where(Meeting.status.in_(non_terminal))
+                    .outerjoin(BotStartRequest, BotStartRequest.meeting_id == Meeting.id)
+                    .where(
+                        Meeting.status.in_(non_terminal),
+                        or_(
+                            BotStartRequest.assignment_id.is_(None),
+                            ~BotStartRequest.phase.in_(("reserved", "launching", "cancel_pending")),
+                        ),
+                    )
                     .order_by(MeetingSession.id.desc())
                 )
             ).all()
@@ -514,6 +523,530 @@ class SqlAlchemyMeetingRepo:
                 ) from e
             await db.refresh(m)
             return _row_to_dict(m)
+
+    async def reserve_assignment_start(
+        self, *, assignment_id, user_id, request_hash, platform, native_meeting_id, data,
+        max_concurrent=None,
+    ) -> dict:
+        """Bind one globally unique assignment to its tenant and start identities atomically."""
+        from sqlalchemy import bindparam, func, select, text
+
+        from ..sessions.models import BotStartRequest, Meeting, MeetingSession
+
+        if max_concurrent is not None and max_concurrent <= 0:
+            raise MaxBotsExceeded(user_id, max_concurrent)
+        active = ["requested", "joining", "awaiting_admission", "active"]
+        async with self._session_factory() as db:
+            # Global assignment binding first, then per-user admission serialization. Every caller
+            # takes locks in this order, so two tenants cannot race-claim one external assignment.
+            await db.execute(text(
+                "SELECT pg_advisory_xact_lock(hashtextextended(:assignment_id, 0))"
+            ), {"assignment_id": assignment_id})
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:uid)").bindparams(bindparam("uid", user_id))
+            )
+
+            existing = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).first()
+            if existing is not None:
+                start, meeting = existing
+                if start.user_id != user_id:
+                    raise AssignmentOwnerConflict(assignment_id)
+                if start.request_hash != request_hash:
+                    raise AssignmentPayloadConflict(assignment_id)
+                return {
+                    "assignment_id": start.assignment_id,
+                    "user_id": start.user_id,
+                    "request_hash": start.request_hash,
+                    "meeting_id": start.meeting_id,
+                    "connection_id": start.connection_id,
+                    "workload_id": start.workload_id,
+                    "phase": start.phase,
+                    "phase_updated_at": start.phase_updated_at,
+                    "lease_token": start.lease_token,
+                    "lease_until": start.lease_until,
+                    "launch_attempt": start.launch_attempt,
+                    "started_at": start.started_at,
+                    "teardown_backend": start.teardown_backend,
+                    "teardown_identity": start.teardown_identity,
+                    "teardown_confirmed_at": start.teardown_confirmed_at,
+                    "last_error_code": start.last_error_code,
+                    "meeting": _row_to_dict(meeting),
+                    "replay": True,
+                }
+
+            duplicate = (await db.execute(
+                select(Meeting.id).where(
+                    Meeting.user_id == user_id,
+                    Meeting.platform == platform,
+                    Meeting.platform_specific_id == native_meeting_id,
+                    Meeting.status.in_(active),
+                )
+            )).scalars().first()
+            if duplicate is not None:
+                raise DuplicateMeeting(
+                    f"An active meeting already exists for {platform}/{native_meeting_id}"
+                )
+            if max_concurrent is not None:
+                count_stmt = select(func.count()).select_from(Meeting).where(
+                    Meeting.user_id == user_id,
+                    Meeting.status.in_(active),
+                    Meeting.platform != "browser_session",
+                )
+                count = int((await db.execute(count_stmt)).scalar() or 0)
+                if count >= max_concurrent:
+                    raise MaxBotsExceeded(user_id, max_concurrent)
+
+            from sqlalchemy.orm.attributes import flag_modified
+
+            meeting = (await db.execute(
+                select(Meeting).where(
+                    Meeting.user_id == user_id,
+                    Meeting.platform == platform,
+                    Meeting.platform_specific_id == native_meeting_id,
+                    Meeting.status.in_(("idle", "scheduled")),
+                ).order_by(Meeting.created_at.desc()).limit(1).with_for_update()
+            )).scalars().first()
+            if meeting is None:
+                meeting = Meeting(
+                    user_id=user_id,
+                    platform=platform,
+                    platform_specific_id=native_meeting_id,
+                    status="requested",
+                    data=dict(data or {}),
+                )
+                db.add(meeting)
+            else:
+                meeting.status = "requested"
+                meeting.end_time = None
+                meeting.bot_container_id = None
+                meeting.data = {**dict(meeting.data or {}), **dict(data or {})}
+                flag_modified(meeting, "data")
+            await db.flush()
+
+            connection_id = assignment_id
+            workload_id = f"mtg-{meeting.id}-{assignment_id.replace('-', '')[:12]}"
+            # Make the deterministic workload visible to the normal bounded reconciler before the
+            # external start. A crash before runtime is eventually expired as continuously
+            # untracked; an accepted workload is protected by the runtime liveness probe.
+            meeting.bot_container_id = workload_id
+            db.add(MeetingSession(meeting_id=meeting.id, session_uid=connection_id))
+            start = BotStartRequest(
+                assignment_id=assignment_id,
+                user_id=user_id,
+                request_hash=request_hash,
+                meeting_id=meeting.id,
+                connection_id=connection_id,
+                workload_id=workload_id,
+                phase="reserved",
+            )
+            db.add(start)
+            await db.commit()
+            await db.refresh(meeting)
+            return {
+                "assignment_id": assignment_id,
+                "user_id": user_id,
+                "request_hash": request_hash,
+                "meeting_id": meeting.id,
+                "connection_id": connection_id,
+                "workload_id": workload_id,
+                "phase": "reserved",
+                "phase_updated_at": start.phase_updated_at,
+                "lease_token": None,
+                "lease_until": None,
+                "launch_attempt": 0,
+                "started_at": None,
+                "teardown_backend": None,
+                "teardown_identity": None,
+                "teardown_confirmed_at": None,
+                "last_error_code": None,
+                "meeting": _row_to_dict(meeting),
+                "replay": False,
+            }
+
+    async def get_assignment_start(
+        self, *, assignment_id, user_id, request_hash,
+    ) -> Optional[dict]:
+        from sqlalchemy import select
+
+        from ..sessions.models import BotStartRequest, Meeting
+
+        async with self._session_factory() as db:
+            existing = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(BotStartRequest.assignment_id == assignment_id)
+            )).first()
+            if existing is None:
+                return None
+            start, meeting = existing
+            if start.user_id != user_id:
+                raise AssignmentOwnerConflict(assignment_id)
+            if start.request_hash != request_hash:
+                raise AssignmentPayloadConflict(assignment_id)
+            return {
+                "assignment_id": start.assignment_id,
+                "user_id": start.user_id,
+                "request_hash": start.request_hash,
+                "meeting_id": start.meeting_id,
+                "connection_id": start.connection_id,
+                "workload_id": start.workload_id,
+                "phase": start.phase,
+                "phase_updated_at": start.phase_updated_at,
+                "lease_token": start.lease_token,
+                "lease_until": start.lease_until,
+                "launch_attempt": start.launch_attempt,
+                "started_at": start.started_at,
+                "teardown_backend": start.teardown_backend,
+                "teardown_identity": start.teardown_identity,
+                "teardown_confirmed_at": start.teardown_confirmed_at,
+                "last_error_code": start.last_error_code,
+                "meeting": _row_to_dict(meeting),
+                "replay": True,
+            }
+
+    async def mark_assignment_started(
+        self, *, assignment_id, user_id, workload_id, lease_token, started_at,
+    ) -> dict:
+        from datetime import datetime
+        from sqlalchemy import select, text
+
+        from ..sessions.models import BotStartRequest, Meeting
+        from .ports import AssignmentLeaseLost, AssignmentTerminalConflict
+
+        async with self._session_factory() as db:
+            start = (await db.execute(
+                select(BotStartRequest)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).scalars().one()
+            if start.user_id != user_id:
+                raise AssignmentOwnerConflict(assignment_id)
+            if start.workload_id != workload_id:
+                raise AssignmentPayloadConflict(assignment_id)
+            meeting = (await db.execute(
+                select(Meeting).where(Meeting.id == start.meeting_id).with_for_update()
+            )).scalars().one()
+            if start.phase == "started":
+                return _row_to_dict(meeting)
+            if start.phase != "launching" or start.lease_token != lease_token:
+                raise AssignmentLeaseLost(assignment_id)
+            if start.phase == "cancelled" or meeting.status in ("completed", "failed"):
+                raise AssignmentTerminalConflict(assignment_id)
+            if meeting.bot_container_id not in (None, workload_id):
+                raise AssignmentPayloadConflict(assignment_id)
+            meeting.bot_container_id = workload_id
+            start.phase = "started"
+            start.phase_updated_at = (await db.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            start.started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            start.lease_token = None
+            start.lease_until = None
+            start.last_error_code = None
+            await db.commit()
+            await db.refresh(meeting)
+            return _row_to_dict(meeting)
+
+    async def claim_assignment_launch(
+        self, *, assignment_id, user_id, request_hash,
+    ) -> dict:
+        import uuid
+        from datetime import timedelta
+        from sqlalchemy import select, text
+
+        from ..sessions.models import BotStartRequest, Meeting
+        from .ports import AssignmentInProgress
+
+        async with self._session_factory() as db:
+            row = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).one()
+            start, meeting = row
+            if start.user_id != user_id:
+                raise AssignmentOwnerConflict(assignment_id)
+            if start.request_hash != request_hash:
+                raise AssignmentPayloadConflict(assignment_id)
+            now = (await db.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            # Request traffic may launch only from reserved.  Expired launching rows belong to the
+            # reconciler: an empty registry lookup is not proof that the substrate never accepted
+            # the previous create.
+            if start.phase != "reserved":
+                raise AssignmentInProgress(assignment_id)
+            start.phase = "launching"
+            start.phase_updated_at = now
+            start.lease_token = str(uuid.uuid4())
+            start.lease_until = now + timedelta(seconds=45)
+            start.launch_attempt = int(start.launch_attempt or 0) + 1
+            start.teardown_backend = None
+            start.teardown_identity = None
+            start.teardown_confirmed_at = None
+            await db.commit()
+            return {
+                "assignment_id": start.assignment_id,
+                "user_id": start.user_id,
+                "request_hash": start.request_hash,
+                "meeting_id": start.meeting_id,
+                "connection_id": start.connection_id,
+                "workload_id": start.workload_id,
+                "phase": start.phase,
+                "phase_updated_at": start.phase_updated_at,
+                "lease_token": start.lease_token,
+                "lease_until": start.lease_until,
+                "launch_attempt": start.launch_attempt,
+                "started_at": start.started_at,
+                "teardown_backend": start.teardown_backend,
+                "teardown_identity": start.teardown_identity,
+                "teardown_confirmed_at": start.teardown_confirmed_at,
+                "last_error_code": start.last_error_code,
+                "meeting": _row_to_dict(meeting),
+                "replay": start.launch_attempt > 1,
+            }
+
+    async def record_assignment_error(
+        self, *, assignment_id, user_id, error_code,
+    ) -> None:
+        from sqlalchemy import select
+
+        from ..sessions.models import BotStartRequest, Meeting
+
+        safe_code = error_code if error_code in {"runtime_start_failed", "finalize_failed"} else "unknown"
+        async with self._session_factory() as db:
+            start = (await db.execute(
+                select(BotStartRequest)
+                .where(
+                    BotStartRequest.assignment_id == assignment_id,
+                    BotStartRequest.user_id == user_id,
+                )
+                .with_for_update()
+            )).scalars().first()
+            if start is not None:
+                start.last_error_code = safe_code
+                await db.commit()
+
+    async def release_assignment_launch(
+        self, *, assignment_id, user_id, lease_token, error_code, never_started=False,
+    ) -> None:
+        from sqlalchemy import select, text
+
+        from ..sessions.models import BotStartRequest
+        from .ports import AssignmentLeaseLost
+
+        safe_code = (
+            "runtime_never_started" if never_started
+            else "runtime_start_failed" if error_code == "runtime_start_failed"
+            else "unknown"
+        )
+        async with self._session_factory() as db:
+            start = (await db.execute(
+                select(BotStartRequest)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).scalars().one()
+            if (
+                start.user_id != user_id
+                or start.phase != "launching"
+                or start.lease_token != lease_token
+            ):
+                raise AssignmentLeaseLost(assignment_id)
+            start.phase = "reserved"
+            start.phase_updated_at = (await db.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            start.lease_token = None
+            start.lease_until = None
+            start.last_error_code = safe_code
+            if never_started:
+                start.teardown_confirmed_at = (
+                    await db.execute(text("SELECT clock_timestamp()"))
+                ).scalar_one()
+            await db.commit()
+
+    async def record_assignment_teardown_identity(
+        self, *, assignment_id, lease_token, error_code, teardown_backend, teardown_identity,
+    ) -> dict:
+        from sqlalchemy import select
+        from ..sessions.models import BotStartRequest, Meeting
+        from .ports import AssignmentLeaseLost
+
+        async with self._session_factory() as db:
+            start, meeting = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).one()
+            if start.phase != "launching" or start.lease_token != lease_token:
+                raise AssignmentLeaseLost(assignment_id)
+            if not teardown_backend or not teardown_identity:
+                raise AssignmentLeaseLost(assignment_id)
+            start.teardown_backend = teardown_backend
+            start.teardown_identity = teardown_identity
+            start.last_error_code = (
+                error_code if error_code in {"runtime_start_failed", "launch_expired"} else "unknown"
+            )
+            await db.commit()
+            return {
+                "assignment_id": start.assignment_id, "user_id": start.user_id,
+                "request_hash": start.request_hash, "meeting_id": start.meeting_id,
+                "connection_id": start.connection_id, "workload_id": start.workload_id,
+                "phase": start.phase, "lease_token": start.lease_token,
+                "launch_attempt": start.launch_attempt,
+                "teardown_backend": start.teardown_backend,
+                "teardown_identity": start.teardown_identity,
+                "teardown_confirmed_at": start.teardown_confirmed_at,
+                "last_error_code": start.last_error_code, "meeting": _row_to_dict(meeting),
+            }
+
+    async def claim_assignment_reconcile_candidates(self, *, limit=20) -> list[dict]:
+        import uuid
+        from datetime import timedelta
+        from sqlalchemy import and_, or_, select, text
+
+        from ..sessions.models import BotStartRequest, Meeting
+
+        async with self._session_factory() as db:
+            now = (await db.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            rows = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(or_(
+                    and_(
+                        BotStartRequest.phase == "reserved",
+                        BotStartRequest.phase_updated_at <= now - timedelta(seconds=120),
+                    ),
+                    and_(
+                        BotStartRequest.phase.in_(("launching", "cancel_pending")),
+                        or_(
+                            BotStartRequest.lease_until.is_(None),
+                            BotStartRequest.lease_until <= now,
+                        ),
+                    ),
+                ))
+                .order_by(BotStartRequest.phase_updated_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )).all()
+            claimed = []
+            for start, meeting in rows:
+                if start.phase == "reserved":
+                    start.phase = "cancel_pending"
+                    if start.last_error_code != "runtime_never_started":
+                        start.last_error_code = "reservation_expired"
+                start.phase_updated_at = now
+                start.lease_token = str(uuid.uuid4())
+                start.lease_until = now + timedelta(seconds=45)
+                claimed.append((start, meeting))
+            await db.commit()
+            return [{
+                "assignment_id": start.assignment_id,
+                "user_id": start.user_id,
+                "request_hash": start.request_hash,
+                "meeting_id": start.meeting_id,
+                "connection_id": start.connection_id,
+                "workload_id": start.workload_id,
+                "phase": start.phase,
+                "phase_updated_at": start.phase_updated_at,
+                "lease_token": start.lease_token,
+                "lease_until": start.lease_until,
+                "launch_attempt": start.launch_attempt,
+                "started_at": start.started_at,
+                "teardown_backend": start.teardown_backend,
+                "teardown_identity": start.teardown_identity,
+                "teardown_confirmed_at": start.teardown_confirmed_at,
+                "last_error_code": start.last_error_code,
+                "meeting": _row_to_dict(meeting),
+                "replay": True,
+            } for start, meeting in claimed]
+
+    async def begin_assignment_cancel(
+        self, *, assignment_id, lease_token, error_code, teardown_backend, teardown_identity,
+    ) -> dict:
+        from sqlalchemy import select, text
+
+        from ..sessions.models import BotStartRequest, Meeting
+        from .ports import AssignmentLeaseLost
+
+        async with self._session_factory() as db:
+            row = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).one()
+            start, meeting = row
+            if start.phase != "launching" or start.lease_token != lease_token:
+                raise AssignmentLeaseLost(assignment_id)
+            if not teardown_backend or not teardown_identity:
+                raise AssignmentLeaseLost(assignment_id)
+            start.phase = "cancel_pending"
+            start.teardown_backend = teardown_backend
+            start.teardown_identity = teardown_identity
+            start.phase_updated_at = (await db.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            start.last_error_code = (
+                error_code if error_code in {"runtime_start_failed", "launch_expired"} else "unknown"
+            )
+            await db.commit()
+            return {
+                "assignment_id": start.assignment_id,
+                "user_id": start.user_id,
+                "meeting_id": start.meeting_id,
+                "connection_id": start.connection_id,
+                "workload_id": start.workload_id,
+                "phase": start.phase,
+                "lease_token": start.lease_token,
+                "launch_attempt": start.launch_attempt,
+                "teardown_backend": start.teardown_backend,
+                "teardown_identity": start.teardown_identity,
+                "meeting": _row_to_dict(meeting),
+            }
+
+    async def complete_assignment_cancel(self, *, assignment_id, lease_token) -> None:
+        from sqlalchemy import select, text
+
+        from ..sessions.models import BotStartRequest, Meeting
+        from .ports import AssignmentLeaseLost, AssignmentLifecycleUnconfirmed
+
+        async with self._session_factory() as db:
+            start, meeting = (await db.execute(
+                select(BotStartRequest, Meeting)
+                .join(Meeting, Meeting.id == BotStartRequest.meeting_id)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).one()
+            if start.phase != "cancel_pending" or start.lease_token != lease_token:
+                raise AssignmentLeaseLost(assignment_id)
+            if start.teardown_confirmed_at is None or meeting.status not in ("completed", "failed"):
+                raise AssignmentLifecycleUnconfirmed(assignment_id)
+            now = (await db.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            start.phase = "cancelled"
+            start.phase_updated_at = now
+            start.lease_token = None
+            start.lease_until = None
+            await db.commit()
+
+    async def record_assignment_teardown(self, *, assignment_id, lease_token) -> None:
+        from sqlalchemy import select, text
+
+        from ..sessions.models import BotStartRequest
+        from .ports import AssignmentLeaseLost
+
+        async with self._session_factory() as db:
+            start = (await db.execute(
+                select(BotStartRequest)
+                .where(BotStartRequest.assignment_id == assignment_id)
+                .with_for_update()
+            )).scalars().one()
+            if start.phase != "cancel_pending" or start.lease_token != lease_token:
+                raise AssignmentLeaseLost(assignment_id)
+            if start.teardown_confirmed_at is None:
+                start.teardown_confirmed_at = (
+                    await db.execute(text("SELECT clock_timestamp()"))
+                ).scalar_one()
+            await db.commit()
 
     async def list_scheduled_meetings(self) -> list[dict]:
         """Every ``scheduled`` row with a joinable link (the auto-join sweep's candidate set —
@@ -908,6 +1441,42 @@ class HttpRuntimeClient:
         if resp.status_code != 200:
             raise SpawnFailed(f"runtime kernel get_workload returned {resp.status_code}")
         return resp.json()
+
+    async def get_teardown_identity(self, workload_id: str) -> dict:
+        resp = await self._client.get(
+            f"{self._url}/workloads/{workload_id}/teardown-identity", timeout=10.0,
+        )
+        if resp.status_code != 200:
+            raise SpawnFailed("runtime immutable teardown identity is unavailable")
+        body = resp.json()
+        if not body.get("backend") or (not body.get("identity") and body.get("neverStarted") is not True):
+            raise SpawnFailed("runtime immutable teardown identity is invalid")
+        return body
+
+    async def probe_claimed_workload(self, workload_id: str, *, claim_hash: str) -> dict:
+        resp = await self._client.post(
+            f"{self._url}/workloads/{workload_id}/claimed-probe",
+            json={"claimHash": claim_hash}, timeout=10.0,
+        )
+        if resp.status_code != 200:
+            raise SpawnFailed("runtime claim-bound substrate proof is unavailable")
+        body = resp.json()
+        if body.get("neverStarted") is True and body.get("backend"):
+            return body
+        if not body.get("backend") or not body.get("identity") or not body.get("state"):
+            raise SpawnFailed("runtime claim-bound substrate proof is invalid")
+        return body
+
+    async def delete_workload_attested(
+        self, workload_id: str, *, backend: str, identity: str, claim_hash: str,
+    ) -> None:
+        resp = await self._client.post(
+            f"{self._url}/workloads/{workload_id}/attested-teardown",
+            json={"backend": backend, "identity": identity, "claimHash": claim_hash},
+            timeout=60.0,
+        )
+        if resp.status_code >= 400:
+            raise SpawnFailed("runtime attested teardown is unconfirmed")
 
 
 def build_production_router(*, database_url: Optional[str] = None, runtime_api_url: Optional[str] = None):

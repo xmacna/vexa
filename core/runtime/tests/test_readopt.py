@@ -15,6 +15,7 @@ These tests prove, against a FAKE docker socket / fake kubectl:
 from __future__ import annotations
 
 import json
+import pytest
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -24,7 +25,7 @@ from runtime_kernel import Runtime
 from runtime_kernel.api import create_app
 from runtime_kernel.backend import WorkloadHandle
 from runtime_kernel.docker_backend import DockerBackend
-from runtime_kernel.models import RuntimeState, WorkloadSpec, WorkloadStatus
+from runtime_kernel.models import RuntimeState, StopReason, WorkloadSpec, WorkloadStatus
 from runtime_kernel.store import InMemoryStore, WorkloadRecord
 
 
@@ -75,6 +76,7 @@ class FakeDockerSession:
                 if network_filter and c.get("network") not in network_filter:
                     continue
                 entries.append({
+                    "Id": c.get("id", name),
                     "Names": [f"/{name}"],
                     "Labels": labels,
                     "State": "running" if c.get("running") else "exited",
@@ -87,9 +89,12 @@ class FakeDockerSession:
                 return _Resp(404, {"message": "no such container"})
             net = c.get("network")
             return _Resp(200, {
+                "Id": c.get("id", name),
+                "Config": {"Labels": c.get("labels", {})},
                 "State": {
                     "Running": bool(c.get("running")),
                     "ExitCode": c.get("exit_code", 0),
+                    "StartedAt": c.get("started_at", "0001-01-01T00:00:00Z"),
                 },
                 "HostConfig": {"NetworkMode": net or "default"},
                 "NetworkSettings": {"Networks": {net: {}} if net else {}},
@@ -122,12 +127,15 @@ LABELS = {"runtime.managed": "true", "runtime.workload_id": "mtg-2-d93eee39"}
 
 # ── DockerBackend discovery ──────────────────────────────────────────────────────────────────────
 def test_docker_discovers_labelled_running_container():
-    be, _ = _backend({"vexa-mtg-2-d93eee39": {"labels": dict(LABELS), "running": True}})
+    be, _ = _backend({
+        "vexa-mtg-2-d93eee39": {
+            "id": "immutable-container-id", "labels": dict(LABELS), "running": True,
+        },
+    })
     found = be.list_workload_containers()
-    assert found == [{
-        "workload_id": "mtg-2-d93eee39", "name": "vexa-mtg-2-d93eee39",
-        "running": True, "exit_code": None,
-    }]
+    assert len(found) == 1
+    assert found[0]["workload_id"] == "mtg-2-d93eee39"
+    assert found[0]["handle"]._impl == "immutable-container-id"
 
 
 def test_docker_discovers_exited_container_with_exit_code():
@@ -253,6 +261,34 @@ def test_docker_cleanup_raises_when_delete_fails():
         pass
 
 
+def test_docker_identity_cleanup_never_deletes_same_name_replacement():
+    containers = {
+        "vexa-assignment-workload": {
+            "id": "replacement-id", "labels": {}, "running": True,
+        },
+    }
+    backend, _ = _backend(containers)
+
+    backend.cleanup_identity("assignment-workload", "immutable-old-id", "a" * 64)
+
+    assert "vexa-assignment-workload" in containers
+
+
+def test_docker_attested_cleanup_rejects_foreign_identity_without_delete():
+    containers = {
+        "foreign-id": {
+            "id": "foreign-id", "labels": {"runtime.managed": "false"}, "running": True,
+        },
+    }
+    backend, fake = _backend(containers)
+
+    with pytest.raises(RuntimeError, match="does not belong"):
+        backend.cleanup_identity("assignment-workload", "foreign-id", "a" * 64)
+
+    assert not any(method == "DELETE" for method, _ in fake.calls)
+    assert "foreign-id" in containers
+
+
 # ── kernel re-adoption (the registry half of the fix) ────────────────────────────────────────────
 def _restarted_runtime(containers: dict[str, dict]) -> tuple[Runtime, FakeDockerSession]:
     """A FRESH Runtime (empty in-memory store + handle map — exactly the post-recreate state)
@@ -291,6 +327,7 @@ def test_adopt_exited_container_reports_stopped_with_evidence():
     status = rt.get("mtg-9-dead")
     assert status.state is RuntimeState.stopped
     assert status.exitCode == 1
+    assert status.startedAt is None, "adoption must never fabricate missing substrate proof"
 
 
 def test_stop_after_adoption_reaches_the_real_container():
@@ -350,6 +387,168 @@ def test_adopt_preserves_records_a_durable_store_kept():
     assert "mtg-2-d93eee39" in rt._handles              # …but the handle is live again
 
 
+def test_adopt_preserves_immutable_backend_handle_across_occupant_swap():
+    """Discovery names are not teardown identities: adoption must retain find()'s container ID/UID."""
+
+    class SwappingBackend:
+        name = "docker"
+
+        def __init__(self):
+            self.current_id = "immutable-old"
+            self.cleaned = []
+
+        def list_workload_containers(self):
+            return [{
+                "workload_id": "assignment-workload",
+                "name": "stable-name",
+                "handle": WorkloadHandle(id="assignment-workload", impl=self.current_id),
+                "claim_hash": "a" * 52,
+                "running": True,
+                "exit_code": None,
+                "started_at": "2026-06-20T09:00:01Z",
+            }]
+
+        def find(self, workload_id, *, claim_hash=None):
+            raise AssertionError("atomic discovery handle must not be replaced by a second lookup")
+
+        def cleanup(self, handle):
+            self.cleaned.append(handle._impl)
+
+        def exit_code(self, handle):
+            return None
+
+    backend = SwappingBackend()
+    runtime = Runtime(backend=backend, profiles={})  # production boot: process-local store is empty
+
+    assert runtime.adopt() == 1
+    backend.current_id = "replacement-foreign"
+    runtime.destroy("assignment-workload")
+
+    assert backend.cleaned == ["immutable-old"]
+
+
+def test_attested_teardown_survives_runtime_restart_with_empty_store():
+    class IdentityBackend:
+        name = "docker"
+
+        def __init__(self):
+            self.original_exists = True
+            self.replacement_exists = False
+
+        def list_workload_containers(self):
+            return [{
+                "workload_id": "assignment-workload", "name": "stable-name",
+                "handle": WorkloadHandle(id="assignment-workload", impl="immutable-old"),
+                "claim_hash": "a" * 52, "running": True, "exit_code": None,
+                "started_at": "2026-06-20T09:00:01Z",
+            }] if self.original_exists else []
+
+        def teardown_identity(self, handle):
+            return handle._impl
+
+        def cleanup_identity(self, workload_id, identity, claim_hash):
+            assert identity == "immutable-old"
+            assert claim_hash == "a" * 64
+            self.original_exists = False
+
+        def exit_code(self, handle):
+            return None
+
+    backend = IdentityBackend()
+    before_crash = Runtime(backend=backend, profiles={})
+    assert before_crash.adopt() == 1
+    first_api = TestClient(create_app(before_crash))
+    receipt_response = first_api.get(
+        "/workloads/assignment-workload/teardown-identity"
+    )
+    assert receipt_response.status_code == 200
+    receipt = receipt_response.json()
+    receipt["claimHash"] = "a" * 64
+    assert first_api.post(
+        "/workloads/assignment-workload/attested-teardown", json=receipt,
+    ).status_code == 200
+
+    backend.replacement_exists = True
+    after_crash = Runtime(backend=backend, profiles={})
+    second_api = TestClient(create_app(after_crash))
+    destroyed = second_api.post(
+        "/workloads/assignment-workload/attested-teardown", json=receipt,
+    )
+
+    assert destroyed.status_code == 200
+    assert destroyed.json()["state"] == "destroyed"
+    assert backend.replacement_exists is True
+
+
+def test_failed_identity_probe_is_not_misreported_as_never_started():
+    class UnavailableBackend:
+        name = "docker"
+        def find(self, workload_id, *, claim_hash=None):
+            raise RuntimeError("daemon unavailable")
+
+    store = InMemoryStore()
+    spec = WorkloadSpec(
+        workloadId="assignment-workload", profile="meeting-bot",
+        env={"VEXA_WORKLOAD_CLAIM_HASH": "a" * 64},
+    )
+    store.set(WorkloadRecord(
+        spec=spec,
+        status=WorkloadStatus(
+            workloadId=spec.workloadId, profile=spec.profile, state=RuntimeState.stopped,
+            backend="docker", stopReason=StopReason.start_failed,
+        ),
+        owner="test",
+    ))
+
+    with pytest.raises(RuntimeError, match="daemon unavailable"):
+        Runtime(backend=UnavailableBackend(), profiles={}, store=store).teardown_identity(
+            spec.workloadId
+        )
+
+
+def test_claimed_probe_is_stateless_and_distinguishes_absent_owned_and_foreign(monkeypatch):
+    monkeypatch.delenv("DOCKER_NETWORK", raising=False)
+    claim = "a" * 64
+    labels = {
+        "runtime.managed": "true", "runtime.workload_id": "assignment-workload",
+        "runtime.claim_hash": claim[:52],
+    }
+    backend, _ = _backend({
+        "vexa-assignment-workload": {
+            "id": "immutable-owned", "labels": labels, "running": False,
+            "started_at": "2026-06-20T09:00:01Z",
+        },
+    })
+    runtime = Runtime(backend=backend, profiles={})  # deliberately empty InMemoryStore
+
+    owned = runtime.probe_claimed("assignment-workload", claim)
+    assert owned == {
+        "backend": "docker", "identity": "immutable-owned", "state": "stopped",
+        "startedAt": "2026-06-20T09:00:01Z",
+    }
+    response = TestClient(create_app(runtime)).post(
+        "/workloads/assignment-workload/claimed-probe", json={"claimHash": claim},
+    )
+    assert response.status_code == 200
+    assert response.json() == owned
+
+    absent_backend, _ = _backend({})
+    assert Runtime(backend=absent_backend, profiles={}).probe_claimed(
+        "assignment-workload", claim,
+    ) == {"backend": "docker", "neverStarted": True}
+
+    foreign_backend, foreign_session = _backend({
+        "vexa-assignment-workload": {
+            "id": "foreign", "labels": {"runtime.managed": "false"}, "running": True,
+        },
+    })
+    with pytest.raises(RuntimeError, match="foreign"):
+        Runtime(backend=foreign_backend, profiles={}).probe_claimed(
+            "assignment-workload", claim,
+        )
+    assert not any(method == "DELETE" for method, _ in foreign_session.calls)
+
+
 def test_adopt_is_idempotent():
     rt, _ = _restarted_runtime({"vexa-mtg-2-d93eee39": {"labels": dict(LABELS), "running": True}})
     assert rt.adopt() == 1
@@ -374,7 +573,12 @@ def test_k8s_start_stamps_adoption_labels(monkeypatch):
         calls.append(args)
         class R:  # noqa: N801 — minimal stand-in
             returncode = 0
-            stdout = ""
+            stdout = json.dumps({"metadata": {}, "status": {
+                "phase": "Running",
+                "containerStatuses": [{"state": {"running": {
+                    "startedAt": "2026-06-20T09:00:01Z",
+                }}}],
+            }})
             stderr = ""
         return R()
 
@@ -383,19 +587,325 @@ def test_k8s_start_stamps_adoption_labels(monkeypatch):
 
     be = k8s_backend.K8sBackend()
     be.start("mtg-2-d93eee39", Runnable(image="img"), {})
-    (run_args,) = calls
-    assert "--labels=runtime.managed=true,runtime.workload_id=mtg-2-d93eee39" in run_args
+    run_args = calls[0]
+    labels = next(value for value in run_args if value.startswith("--labels="))
+    assert "runtime.managed=true" in labels
+    assert "runtime.workload_id=mtg-2-d93eee39" in labels
+    assert "runtime.spec_hash=" in labels
+
+
+def test_k8s_start_attaches_only_to_exact_live_spec_on_conflict(monkeypatch):
+    from runtime_kernel import k8s_backend
+    from runtime_kernel.backend import SPEC_HASH_LABEL, launch_spec_hash
+    from runtime_kernel.profiles import Runnable
+
+    runnable = Runnable(image="img", command=["run"])
+    expected_hash = launch_spec_hash(runnable, {"A": "1"}, substrate={"overrides": {}})
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 1 if args[0] == "run" else 0
+            stdout = json.dumps({
+                "metadata": {"labels": {
+                    "runtime.managed": "true",
+                    "runtime.workload_id": "mtg-2-d93eee39",
+                    SPEC_HASH_LABEL: expected_hash,
+                }},
+                "status": {"phase": "Running", "containerStatuses": [{
+                    "state": {"running": {"startedAt": "2026-06-20T09:00:01Z"}},
+                }]},
+            })
+            stderr = "AlreadyExists"
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    h = k8s_backend.K8sBackend().start("mtg-2-d93eee39", runnable, {"A": "1"})
+
+    assert h.id == "mtg-2-d93eee39"
+    assert [call[0] for call in calls] == ["run", "get"]
+    assert not any("delete" in call for call in calls)
+
+
+def test_k8s_start_rejects_foreign_conflict_without_delete(monkeypatch):
+    from runtime_kernel import k8s_backend
+    from runtime_kernel.profiles import Runnable
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 1 if args[0] == "run" else 0
+            stdout = json.dumps({
+                "metadata": {"labels": {
+                    "runtime.managed": "true",
+                    "runtime.workload_id": "somebody-else",
+                    "runtime.spec_hash": "0" * 52,
+                }},
+                "status": {"phase": "Running", "containerStatuses": [{
+                    "state": {"running": {"startedAt": "2026-06-20T09:00:01Z"}},
+                }]},
+            })
+            stderr = "AlreadyExists"
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    with pytest.raises(RuntimeError, match="foreign"):
+        k8s_backend.K8sBackend().start(
+            "mtg-2-d93eee39", Runnable(image="img"), {"SECRET": "sentinel"},
+        )
+
+    assert not any("delete" in call for call in calls)
+
+
+def test_k8s_claimed_conflict_uses_single_attested_body_without_second_get(monkeypatch):
+    from runtime_kernel import k8s_backend
+    from runtime_kernel.backend import (
+        SPEC_HASH_LABEL, WORKLOAD_CLAIM_ENV, WORKLOAD_CLAIM_LABEL, launch_spec_hash,
+    )
+    from runtime_kernel.profiles import Runnable
+
+    runnable = Runnable(image="img")
+    claim = "a" * 64
+    env = {WORKLOAD_CLAIM_ENV: claim}
+    digest = launch_spec_hash(runnable, env, substrate={"overrides": {}})
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 1 if args[0] == "run" else 0
+            stdout = json.dumps({
+                "metadata": {"uid": "winner-uid", "labels": {
+                    "runtime.managed": "true",
+                    "runtime.workload_id": "mtg-2-d93eee39",
+                    SPEC_HASH_LABEL: digest,
+                    WORKLOAD_CLAIM_LABEL: claim[:52],
+                }},
+                "status": {"phase": "Running", "containerStatuses": [{
+                    "state": {"running": {"startedAt": "2026-06-20T09:00:01Z"}},
+                }]},
+            })
+            stderr = "AlreadyExists"
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    handle = k8s_backend.K8sBackend().start("mtg-2-d93eee39", runnable, env)
+
+    assert handle._impl == {"name": "vexa-mtg-2-d93eee39", "uid": "winner-uid"}
+    assert [call[0] for call in calls] == ["run", "get"]
+
+
+def test_k8s_claimed_create_rejects_foreign_identity_readback(monkeypatch):
+    from runtime_kernel import k8s_backend
+    from runtime_kernel.backend import WORKLOAD_CLAIM_ENV
+    from runtime_kernel.profiles import Runnable
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 0
+            stdout = json.dumps({
+                "metadata": {"uid": "replacement-uid", "labels": {
+                    "runtime.managed": "true",
+                    "runtime.workload_id": "somebody-else",
+                }},
+                "status": {"phase": "Running", "containerStatuses": [{
+                    "state": {"running": {"startedAt": "2026-06-20T09:00:01Z"}},
+                }]},
+            })
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    with pytest.raises(RuntimeError, match="identity is unverifiable"):
+        k8s_backend.K8sBackend().start(
+            "mtg-2-d93eee39", Runnable(image="img"), {WORKLOAD_CLAIM_ENV: "a" * 64},
+        )
+
+    assert [call[0] for call in calls] == ["run", "get"]
+
+
+def test_k8s_pending_without_container_started_at_is_not_start_proof(monkeypatch):
+    from runtime_kernel import k8s_backend
+    from runtime_kernel.profiles import Runnable
+
+    def fake_kubectl(*args: str, check: bool = True):
+        class R:  # noqa: N801
+            returncode = 0
+            stdout = json.dumps({"metadata": {}, "status": {"phase": "Pending"}})
+            stderr = ""
+        return R()
+
+    ticks = iter((0.0, 1.0, 1.0))
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(k8s_backend.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(k8s_backend.time, "sleep", lambda _: None)
+    monkeypatch.setenv("RUNTIME_K8S_START_CONFIRM_TIMEOUT_SEC", "0.1")
+
+    with pytest.raises(RuntimeError, match="timestamp is unconfirmed"):
+        k8s_backend.K8sBackend().start("mtg-pending", Runnable(image="img"), {})
+
+
+def test_kubectl_failure_never_exposes_env_secret(monkeypatch):
+    from runtime_kernel import k8s_backend
+
+    class Failed:
+        returncode = 9
+        stdout = ""
+        stderr = "failed argv --env=VEXA_BOT_CONFIG=sentinel-secret"
+
+    monkeypatch.setattr(k8s_backend.subprocess, "run", lambda *args, **kwargs: Failed())
+    with pytest.raises(RuntimeError) as exc:
+        k8s_backend._kubectl(
+            "run", "bot", "--env=VEXA_BOT_CONFIG=sentinel-secret",
+        )
+
+    assert "sentinel-secret" not in str(exc.value)
+
+
+def test_k8s_claimed_find_rejects_foreign_name_occupant(monkeypatch):
+    from runtime_kernel import k8s_backend
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 0
+            stdout = json.dumps({"metadata": {"labels": {
+                "runtime.managed": "true",
+                "runtime.workload_id": "mtg-2-d93eee39",
+                "runtime.claim_hash": "b" * 52,
+            }}})
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    be = k8s_backend.K8sBackend()
+
+    assert be.find("mtg-2-d93eee39", claim_hash="a" * 64) is None
+    assert [call[0] for call in calls] == ["get"]
+    assert not any("delete" in call for call in calls)
+
+
+def test_k8s_claimed_cleanup_fails_closed_on_delete_error(monkeypatch):
+    from runtime_kernel import k8s_backend
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 1
+            stdout = ""
+            stderr = "forbidden"
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    backend = k8s_backend.K8sBackend()
+    monkeypatch.setattr(backend, "_delete_pod_uid", lambda name, uid: 500)
+    with pytest.raises(RuntimeError, match="delete failed"):
+        backend.cleanup(WorkloadHandle(
+            id="w", impl={"name": "vexa-w", "uid": "winner-uid"},
+        ))
+
+    assert calls == []
+
+
+def test_k8s_claimed_cleanup_never_deletes_replacement_pod(monkeypatch):
+    from runtime_kernel import k8s_backend
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 0
+            stdout = json.dumps({"metadata": {"uid": "replacement-uid"}})
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    backend = k8s_backend.K8sBackend()
+    deleted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        backend, "_delete_pod_uid",
+        lambda name, uid: deleted.append((name, uid)) or 409,
+    )
+    backend.cleanup_identity("w", "winner-uid", "a" * 64)
+
+    assert deleted == []
+    assert not any(call[:3] == ("delete", "pod", "vexa-w") for call in calls)
+
+
+def test_k8s_attested_cleanup_fails_closed_when_identity_lookup_is_forbidden(monkeypatch):
+    from runtime_kernel import k8s_backend
+
+    calls = []
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append(args)
+        class R:  # noqa: N801
+            returncode = 1
+            stdout = ""
+            stderr = "Forbidden"
+        return R()
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+
+    with pytest.raises(RuntimeError, match="unverifiable"):
+        k8s_backend.K8sBackend().cleanup_identity("w", "winner-uid", "a" * 64)
+
+    assert not any(call[:3] == ("delete", "pod", "vexa-w") for call in calls)
+
+
+def test_k8s_claimed_probe_is_stateless_and_claim_bound(monkeypatch):
+    from runtime_kernel import k8s_backend
+
+    claim = "a" * 64
+    body = {
+        "metadata": {"uid": "pod-uid", "labels": {
+            "runtime.managed": "true", "runtime.workload_id": "w",
+            "runtime.claim_hash": claim[:52],
+        }},
+        "status": {"phase": "Succeeded", "containerStatuses": [{
+            "state": {"terminated": {"startedAt": "2026-06-20T09:00:01Z"}},
+        }]},
+    }
+    def found(*args: str, check: bool = True):
+        class R:  # noqa: N801
+            returncode = 0
+            stdout = json.dumps(body)
+            stderr = ""
+        return R()
+    monkeypatch.setattr(k8s_backend, "_kubectl", found)
+    assert Runtime(backend=k8s_backend.K8sBackend(), profiles={}).probe_claimed("w", claim) == {
+        "backend": "k8s", "identity": "pod-uid", "state": "stopped",
+        "startedAt": "2026-06-20T09:00:01Z",
+    }
+
+    body["status"] = {"phase": "Pending", "containerStatuses": []}
+    assert Runtime(backend=k8s_backend.K8sBackend(), profiles={}).probe_claimed("w", claim) == {
+        "backend": "k8s", "identity": "pod-uid", "state": "starting", "startedAt": None,
+    }
+
+    body["metadata"]["labels"]["runtime.claim_hash"] = "b" * 52
+    with pytest.raises(RuntimeError, match="foreign"):
+        Runtime(backend=k8s_backend.K8sBackend(), profiles={}).probe_claimed("w", claim)
 
 
 def test_k8s_discovers_pods_by_label(monkeypatch):
     from runtime_kernel import k8s_backend
 
     pods = {"items": [
-        {"metadata": {"name": "vexa-mtg-2-d93eee39",
+        {"metadata": {"name": "vexa-mtg-2-d93eee39", "uid": "uid-running",
                       "labels": {"runtime.managed": "true",
                                  "runtime.workload_id": "mtg-2-d93eee39"}},
          "status": {"phase": "Running"}},
-        {"metadata": {"name": "vexa-mtg-9-dead",
+        {"metadata": {"name": "vexa-mtg-9-dead", "uid": "uid-dead",
                       "labels": {"runtime.managed": "true",
                                  "runtime.workload_id": "mtg-9-dead"}},
          "status": {"phase": "Failed",
@@ -414,7 +924,9 @@ def test_k8s_discovers_pods_by_label(monkeypatch):
     be = k8s_backend.K8sBackend()
     found = {i["workload_id"]: i for i in be.list_workload_containers()}
     assert found["mtg-2-d93eee39"]["running"] is True
-    assert found["mtg-9-dead"] == {
-        "workload_id": "mtg-9-dead", "name": "vexa-mtg-9-dead",
-        "running": False, "exit_code": 137,
+    assert found["mtg-2-d93eee39"]["handle"]._impl == {
+        "name": "vexa-mtg-2-d93eee39", "uid": "uid-running",
     }
+    assert found["mtg-9-dead"]["running"] is False
+    assert found["mtg-9-dead"]["exit_code"] == 137
+    assert found["mtg-9-dead"]["handle"]._impl["uid"] == "uid-dead"

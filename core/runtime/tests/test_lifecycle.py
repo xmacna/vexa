@@ -1,12 +1,16 @@
 """Stage-2 gate — drive a real workload through the runtime.v1 lifecycle on the process backend,
 and prove every emitted event conforms to the frozen contract (runtime.schema.json)."""
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jsonschema
 from referencing import Registry, Resource
 
 from runtime_kernel import Runtime, WorkloadSpec, RuntimeState
+from runtime_kernel.store import InMemoryStore
 
 SCHEMA = json.loads(
     (Path(__file__).resolve().parents[1] / "contracts" / "runtime.v1" / "runtime.schema.json").read_text()
@@ -107,6 +111,48 @@ def test_create_is_idempotent_touch_while_running():
     assert touched.state is RuntimeState.running
     assert be.starts == ["w1"]                          # ONE spawn — the second create touched
     assert rt.store.get("w1").spec.env == {"A": "1"}    # the running workload keeps its original spec
+
+
+def test_twenty_concurrent_creates_start_the_backend_once():
+    """workloadId is a single-flight key, not only a sequential replay key."""
+
+    class SlowBackend(_FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self._calls_lock = threading.Lock()
+
+        def start(self, workload_id, runnable, env):
+            with self._calls_lock:
+                self.starts.append(workload_id)
+            time.sleep(0.05)  # keep the first create inside the race window
+            self.envs[workload_id] = dict(env)
+            self.exit_codes[workload_id] = None
+            return WorkloadHandle(id=workload_id, impl=workload_id)
+
+    class SlowSnapshotStore(InMemoryStore):
+        """Widen get→persist without coupling the test to Runtime's lock internals."""
+
+        def get(self, workload_id):
+            snapshot = super().get(workload_id)
+            time.sleep(0.03)
+            return snapshot
+
+    backend = SlowBackend()
+    rt = Runtime(
+        backend=backend, profiles={"test": ["true"]}, store=SlowSnapshotStore(),
+    )
+    spec = WorkloadSpec(workloadId="same", profile="test", env={"A": "1"})
+    callers_ready = threading.Barrier(20)
+
+    def create(_):
+        callers_ready.wait()
+        return rt.create(spec)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        statuses = list(pool.map(create, range(20)))
+
+    assert backend.starts == ["same"]
+    assert all(status.state is RuntimeState.running for status in statuses)
 
 
 def test_touch_at_quota_cap_never_raises():

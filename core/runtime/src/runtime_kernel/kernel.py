@@ -12,6 +12,8 @@ count_for_owner."""
 from __future__ import annotations
 
 import time
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -80,6 +82,29 @@ class Runtime:
         self.owner_quota = owner_quota
         # Live, non-serializable backend handles. Empty on a fresh process (post-restart).
         self._handles: dict[str, WorkloadHandle] = {}
+        # ``create`` is a check-then-start sequence. FastAPI executes the sync route in a thread
+        # pool, so two callers can otherwise both observe an absent workload before either persists
+        # ``starting``. Ref-counted per-key locks keep unrelated workloads parallel while ensuring
+        # one workloadId has exactly one creator in this process.
+        self._create_locks_guard = threading.Lock()
+        self._create_locks: dict[str, tuple[threading.Lock, int]] = {}
+
+    @contextmanager
+    def _create_single_flight(self, workload_id: str):
+        with self._create_locks_guard:
+            lock, users = self._create_locks.get(workload_id, (threading.Lock(), 0))
+            self._create_locks[workload_id] = (lock, users + 1)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._create_locks_guard:
+                current_lock, current_users = self._create_locks[workload_id]
+                if current_users == 1:
+                    del self._create_locks[workload_id]
+                else:
+                    self._create_locks[workload_id] = (current_lock, current_users - 1)
 
     def _emit(self, workload_id: str, state: RuntimeState, **kw) -> RuntimeEvent:
         ev = RuntimeEvent(workloadId=workload_id, state=state, at=_now(), **kw)
@@ -102,15 +127,28 @@ class Runtime:
         running (the orphaned-live-bot defect)."""
         h = self._handles.get(workload_id)
         if h is None:
-            finder = getattr(self.backend, "find", None)
-            if finder is not None:
-                try:
-                    h = finder(workload_id)
-                except Exception:  # noqa: BLE001 — a failed lookup means "no handle", never a crash
-                    h = None
-                if h is not None:
-                    self._handles[workload_id] = h
+            h = self._find_backend_handle(workload_id)
+            if h is not None:
+                self._handles[workload_id] = h
         return h
+
+    def _find_backend_handle(self, workload_id: str) -> Optional[WorkloadHandle]:
+        """Return the substrate's attested, immutable handle for a persisted workload."""
+        finder = getattr(self.backend, "find", None)
+        if finder is None:
+            return None
+        from .backend import WORKLOAD_CLAIM_ENV
+
+        record = self.store.get(workload_id)
+        claim_hash = record.spec.env.get(WORKLOAD_CLAIM_ENV) if record is not None else None
+        try:
+            return finder(workload_id, claim_hash=claim_hash)
+        except TypeError:
+            # Compatibility for injected/legacy backends is allowed only for workloads without
+            # an assignment claim. Claimed workloads may never fall back to name-only lookup.
+            if claim_hash is not None:
+                raise
+            return finder(workload_id)
 
     def adopt(self) -> int:
         """Boot-time re-adoption (the orphaned-live-bot fix): ask the backend for the workload
@@ -136,13 +174,36 @@ class Runtime:
             name = info.get("name")
             if not wid or not name:
                 continue
-            self._handles.setdefault(wid, WorkloadHandle(id=wid, impl=name))
-            if self.store.get(wid) is not None:
+            record = self.store.get(wid)
+            discovered_claim = info.get("claim_hash")
+            if record is not None:
+                from .backend import WORKLOAD_CLAIM_ENV
+
+                stored_claim = record.spec.env.get(WORKLOAD_CLAIM_ENV)
+                if stored_claim is not None and discovered_claim != stored_claim[:52]:
+                    continue
+            # Docker/K8s discovery returns ID/UID and claim from one substrate response. A second
+            # name lookup is a TOCTOU: a replacement can appear between list and find.
+            handle = info.get("handle")
+            if handle is None:
+                if self.backend.name in ("docker", "k8s"):
+                    continue
+                handle = self._find_backend_handle(wid) or WorkloadHandle(id=wid, impl=name)
+            self._handles.setdefault(wid, handle)
+            if record is not None:
                 continue                       # durable store kept the record — handle was the gap
-            spec = WorkloadSpec(workloadId=wid, profile="adopted", env={})
+            env = {}
+            if discovered_claim:
+                from .backend import WORKLOAD_CLAIM_ENV
+
+                env[WORKLOAD_CLAIM_ENV] = discovered_claim
+            spec = WorkloadSpec(workloadId=wid, profile="adopted", env=env)
             status = WorkloadStatus(
                 workloadId=wid, profile=spec.profile,
                 state=RuntimeState.running, backend=self.backend.name,
+                # Never manufacture start proof during adoption. Backends surface the substrate's
+                # actual timestamp or leave it absent; absence remains fail-closed.
+                startedAt=info.get("started_at"),
             )
             if not info.get("running"):
                 code = info.get("exit_code")
@@ -156,6 +217,10 @@ class Runtime:
 
     # ── runtime.v1 operations ────────────────────────────────────────────────
     def create(self, spec: WorkloadSpec) -> WorkloadStatus:
+        with self._create_single_flight(spec.workloadId):
+            return self._create_unlocked(spec)
+
+    def _create_unlocked(self, spec: WorkloadSpec) -> WorkloadStatus:
         # runtime.v1: workloadId is the caller-assigned IDEMPOTENCY KEY (ADR 0027). A create for a
         # workload that is still starting/running is a TOUCH — return the live status unchanged: no
         # respawn (the docker backend's name-conflict path would force-delete the RUNNING container,
@@ -196,7 +261,10 @@ class Runtime:
             # layered on top so an explicit spec value always wins. Without this merge the base_env
             # never reaches the spawned pod and chart-set tuning is dead config (issue #771).
             effective_env = {**profile.base_env, **spec.env}
-            self._handles[spec.workloadId] = self.backend.start(spec.workloadId, runnable, effective_env)
+            handle = self.backend.start(spec.workloadId, runnable, effective_env)
+            if self.backend.name in ("docker", "k8s") and not handle.started_at:
+                raise RuntimeError("substrate start timestamp is unconfirmed")
+            self._handles[spec.workloadId] = handle
         except Exception as exc:
             # Record the honest terminal state (persist + emit) FIRST — GET /workloads and the
             # callback stream must still see stopped/start_failed — THEN raise so the API answers a
@@ -209,7 +277,7 @@ class Runtime:
             self._emit(spec.workloadId, RuntimeState.stopped, stopReason=StopReason.start_failed)
             raise StartFailed(spec.workloadId, str(exc)) from exc
         status.state = RuntimeState.running
-        status.startedAt = _now()
+        status.startedAt = handle.started_at or _now()
         status.ports = {}
         self._persist(spec, status)
         self._emit(spec.workloadId, RuntimeState.running, ports={})
@@ -272,6 +340,55 @@ class Runtime:
         h = self._handle_for(workload_id)                           # re-derives post-restart handles
         if h is not None:
             self.backend.cleanup(h)   # raises on an unconfirmed reclaim — destroyed is never a lie
+        status = record.status
+        status.state = RuntimeState.destroyed
+        self._persist(record.spec, status)
+        self._emit(workload_id, RuntimeState.destroyed)
+        return status
+
+    def teardown_identity(self, workload_id: str) -> dict[str, object]:
+        """Return the immutable substrate identity that must be persisted before teardown."""
+        record = self._record(workload_id)
+        handle = self._handle_for(workload_id)
+        identity_fn = getattr(self.backend, "teardown_identity", None)
+        if handle is None and (
+            record.status.state == RuntimeState.stopped
+            and record.status.stopReason == StopReason.start_failed
+        ):
+            # `_handle_for` performed the backend's claim-bound deterministic lookup. No owned
+            # handle means there is no substrate object this assignment may delete.
+            return {"backend": self.backend.name, "neverStarted": True}
+        if handle is None or identity_fn is None:
+            raise RuntimeError("immutable teardown identity is unavailable")
+        return {"backend": self.backend.name, "identity": identity_fn(handle)}
+
+    def probe_claimed(self, workload_id: str, claim_hash: str) -> dict[str, object]:
+        """Stateless, claim-bound substrate proof used after registry loss."""
+        if len(claim_hash) != 64 or any(c not in "0123456789abcdef" for c in claim_hash):
+            raise RuntimeError("claim hash is invalid")
+        probe = getattr(self.backend, "probe_claimed", None)
+        if probe is None:
+            raise RuntimeError("claim-bound substrate probe is unsupported")
+        return probe(workload_id, claim_hash)
+
+    def destroy_attested(
+        self, workload_id: str, *, backend: str, identity: str, claim_hash: str,
+    ) -> WorkloadStatus:
+        """Delete/prove absence of one immutable ID/UID, even with an empty restarted store."""
+        if backend != self.backend.name:
+            raise RuntimeError("teardown backend does not match this runtime")
+        cleanup_identity = getattr(self.backend, "cleanup_identity", None)
+        if cleanup_identity is None or not identity or not claim_hash:
+            raise RuntimeError("attested teardown is unsupported by this backend")
+        cleanup_identity(workload_id, identity, claim_hash)
+        record = self.store.get(workload_id)
+        if record is None:
+            return WorkloadStatus(
+                workloadId=workload_id,
+                profile="attested-teardown",
+                state=RuntimeState.destroyed,
+                backend=self.backend.name,
+            )
         status = record.status
         status.state = RuntimeState.destroyed
         self._persist(record.spec, status)

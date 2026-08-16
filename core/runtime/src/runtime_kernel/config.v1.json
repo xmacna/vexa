@@ -54,9 +54,7 @@
    "class": "defaulted",
    "default": "(unset — kubectl's current namespace)",
    "description": "k8s backend namespace, injected via the downward API",
-   "targets": [
-    "helm"
-   ]
+   "targets": []
   },
   {
    "key": "DOCKER_HOST",
@@ -83,6 +81,13 @@
    "targets": []
   },
   {
+   "key": "RUNTIME_DOCKER_START_CONFIRM_TIMEOUT_SEC",
+   "class": "defaulted",
+   "default": "10",
+   "description": "maximum seconds for the docker backend to confirm a spawned container has a real StartedAt timestamp",
+   "targets": []
+  },
+  {
    "key": "RUNTIME_STOP_GRACE_SEC",
    "class": "defaulted",
    "default": "30",
@@ -106,6 +111,34 @@
    "targets": [
     "helm"
    ]
+  },
+  {
+   "key": "KUBERNETES_SERVICE_HOST",
+   "class": "defaulted",
+   "default": "(injected by Kubernetes for in-cluster API discovery)",
+   "description": "Kubernetes API host used for UID-preconditioned pod deletion",
+   "targets": []
+  },
+  {
+   "key": "KUBERNETES_SERVICE_PORT_HTTPS",
+   "class": "defaulted",
+   "default": "443",
+   "description": "Kubernetes API HTTPS port used for UID-preconditioned pod deletion",
+   "targets": []
+  },
+  {
+   "key": "RUNTIME_K8S_START_CONFIRM_TIMEOUT_SEC",
+   "class": "defaulted",
+   "default": "30",
+   "description": "maximum seconds for the k8s backend to confirm a spawned pod has a real container start timestamp",
+   "targets": []
+  },
+  {
+   "key": "RUNTIME_K8S_DELETE_CONFIRM_TIMEOUT_SEC",
+   "class": "defaulted",
+   "default": "10",
+   "description": "maximum seconds for the k8s backend to confirm the UID-fenced pod is absent or replaced after deletion",
+   "targets": []
   },
   {
    "key": "BROWSER_IMAGE",

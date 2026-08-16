@@ -90,7 +90,12 @@ def test_post_workloads_healthy_spawn_still_201():
 
     class _OkBackend(_DeadAtStartBackend):
         def start(self, workload_id, runnable, env):
-            return WorkloadHandle(id=workload_id, impl=workload_id)
+            # This fake declares itself Docker, so it must satisfy the same acceptance contract as
+            # the real backend: a healthy start includes substrate-originated timestamp proof.
+            return WorkloadHandle(
+                id=workload_id, impl=workload_id,
+                started_at="2026-06-20T09:00:01Z",
+            )
 
         def exit_code(self, h):
             return None

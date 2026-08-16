@@ -16,9 +16,17 @@ fully in-process.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+import uuid
 
 from .ports import (
+    AssignmentOwnerConflict,
+    AssignmentPayloadConflict,
+    AssignmentInProgress,
+    AssignmentLifecycleUnconfirmed,
+    AssignmentLeaseLost,
+    AssignmentTerminalConflict,
     DuplicateMeeting,
     MaxBotsExceeded,
     QuotaExceeded,
@@ -39,6 +47,7 @@ class InMemoryMeetingRepo:
         self._next_id = 1
         self.sessions: list[dict] = []  # exposed for assertions (all sessions, all meetings)
         self.reopened: list[int] = []   # meeting ids continue_meeting reused
+        self.assignment_starts: dict[str, dict] = {}
 
     async def find_active(self, user_id, platform, native_meeting_id) -> Optional[dict]:
         for m in self._meetings.values():
@@ -161,6 +170,224 @@ class InMemoryMeetingRepo:
         }
         self._meetings[mid] = row
         return dict(row)
+
+    async def reserve_assignment_start(
+        self, *, assignment_id, user_id, request_hash, platform, native_meeting_id, data,
+        max_concurrent=None,
+    ) -> dict:
+        existing = self.assignment_starts.get(assignment_id)
+        if existing is not None:
+            if existing["user_id"] != user_id:
+                raise AssignmentOwnerConflict(assignment_id)
+            if existing["request_hash"] != request_hash:
+                raise AssignmentPayloadConflict(assignment_id)
+            return {
+                **dict(existing),
+                "meeting": dict(self._meetings[existing["meeting_id"]]),
+                "replay": True,
+            }
+
+        row = await self.create_meeting_guarded(
+            user_id=user_id, platform=platform, native_meeting_id=native_meeting_id,
+            data=data, max_concurrent=max_concurrent,
+        )
+        connection_id = assignment_id
+        workload_id = f"mtg-{row['id']}-{assignment_id.replace('-', '')[:12]}"
+        # Publish the deterministic substrate identity in the same reservation boundary. The
+        # existing stale-nonterminal reconciler can now probe it: accepted work is protected by
+        # liveness, while a crash before runtime is bounded by its untracked-expiry window.
+        self._meetings[row["id"]]["bot_container_id"] = workload_id
+        row["bot_container_id"] = workload_id
+        start = {
+            "assignment_id": assignment_id,
+            "user_id": user_id,
+            "request_hash": request_hash,
+            "meeting_id": row["id"],
+            "connection_id": connection_id,
+            "workload_id": workload_id,
+            "phase": "reserved",
+            "phase_updated_at": datetime.now(timezone.utc),
+            "lease_token": None,
+            "lease_until": None,
+            "launch_attempt": 0,
+            "started_at": None,
+            "teardown_backend": None,
+            "teardown_identity": None,
+            "teardown_confirmed_at": None,
+            "last_error_code": None,
+        }
+        self.assignment_starts[assignment_id] = start
+        self.sessions.append({"meeting_id": row["id"], "session_uid": connection_id})
+        return {**dict(start), "meeting": dict(row), "replay": False}
+
+    async def get_assignment_start(
+        self, *, assignment_id, user_id, request_hash,
+    ) -> Optional[dict]:
+        existing = self.assignment_starts.get(assignment_id)
+        if existing is None:
+            return None
+        if existing["user_id"] != user_id:
+            raise AssignmentOwnerConflict(assignment_id)
+        if existing["request_hash"] != request_hash:
+            raise AssignmentPayloadConflict(assignment_id)
+        return {
+            **dict(existing),
+            "meeting": dict(self._meetings[existing["meeting_id"]]),
+            "replay": True,
+        }
+
+    async def mark_assignment_started(
+        self, *, assignment_id, user_id, workload_id, lease_token, started_at,
+    ) -> dict:
+        start = self.assignment_starts[assignment_id]
+        if start["user_id"] != user_id:
+            raise AssignmentOwnerConflict(assignment_id)
+        if start["workload_id"] != workload_id:
+            raise AssignmentPayloadConflict(assignment_id)
+        if start["phase"] != "launching" or start["lease_token"] != lease_token:
+            raise AssignmentLeaseLost(assignment_id)
+        row = self._meetings[start["meeting_id"]]
+        if start["phase"] == "cancelled" or row["status"] in _TERMINAL_STATUSES:
+            raise AssignmentTerminalConflict(assignment_id)
+        row["bot_container_id"] = workload_id
+        start["phase"] = "started"
+        start["phase_updated_at"] = datetime.now(timezone.utc)
+        start["started_at"] = started_at
+        start["lease_token"] = None
+        start["lease_until"] = None
+        start["last_error_code"] = None
+        return dict(row)
+
+    async def claim_assignment_launch(
+        self, *, assignment_id, user_id, request_hash,
+    ) -> dict:
+        start = self.assignment_starts[assignment_id]
+        if start["user_id"] != user_id:
+            raise AssignmentOwnerConflict(assignment_id)
+        if start["request_hash"] != request_hash:
+            raise AssignmentPayloadConflict(assignment_id)
+        now = datetime.now(timezone.utc)
+        # Only a never-authorized/released reservation may enter create.  An expired launching
+        # lease is recovery work: runtime absence is not substrate absence and cannot authorize a
+        # blind second start.
+        if start["phase"] != "reserved":
+            raise AssignmentInProgress(assignment_id)
+        start["phase"] = "launching"
+        start["phase_updated_at"] = now
+        start["lease_token"] = str(uuid.uuid4())
+        start["lease_until"] = now + timedelta(seconds=45)
+        start["launch_attempt"] += 1
+        start["teardown_backend"] = None
+        start["teardown_identity"] = None
+        start["teardown_confirmed_at"] = None
+        return {
+            **dict(start),
+            "meeting": dict(self._meetings[start["meeting_id"]]),
+            "replay": start["launch_attempt"] > 1,
+        }
+
+    async def release_assignment_launch(
+        self, *, assignment_id, user_id, lease_token, error_code, never_started=False,
+    ) -> None:
+        start = self.assignment_starts[assignment_id]
+        if (
+            start["user_id"] != user_id
+            or start["phase"] != "launching"
+            or start["lease_token"] != lease_token
+        ):
+            raise AssignmentLeaseLost(assignment_id)
+        start["phase"] = "reserved"
+        start["phase_updated_at"] = datetime.now(timezone.utc)
+        start["lease_token"] = None
+        start["lease_until"] = None
+        start["last_error_code"] = "runtime_never_started" if never_started else error_code[:64]
+        if never_started:
+            start["teardown_confirmed_at"] = datetime.now(timezone.utc)
+
+    async def record_assignment_teardown_identity(
+        self, *, assignment_id, lease_token, error_code, teardown_backend, teardown_identity,
+    ) -> dict:
+        start = self.assignment_starts[assignment_id]
+        if start["phase"] != "launching" or start["lease_token"] != lease_token:
+            raise AssignmentLeaseLost(assignment_id)
+        if not teardown_backend or not teardown_identity:
+            raise AssignmentLeaseLost(assignment_id)
+        start["teardown_backend"] = teardown_backend
+        start["teardown_identity"] = teardown_identity
+        start["last_error_code"] = error_code[:64]
+        return {**dict(start), "meeting": dict(self._meetings[start["meeting_id"]])}
+
+    async def claim_assignment_reconcile_candidates(self, *, limit=20) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        out = []
+        for start in self.assignment_starts.values():
+            expired_reserved = (
+                start["phase"] == "reserved"
+                and start["phase_updated_at"] <= now - timedelta(seconds=120)
+            )
+            expired_lease = (
+                start["phase"] in ("launching", "cancel_pending")
+                and (start["lease_until"] is None or start["lease_until"] <= now)
+            )
+            if not (expired_reserved or expired_lease):
+                continue
+            if expired_reserved:
+                start["phase"] = "cancel_pending"
+                if start["last_error_code"] != "runtime_never_started":
+                    start["last_error_code"] = "reservation_expired"
+            start["phase_updated_at"] = now
+            start["lease_token"] = str(uuid.uuid4())
+            start["lease_until"] = now + timedelta(seconds=45)
+            out.append({
+                **dict(start),
+                "meeting": dict(self._meetings[start["meeting_id"]]),
+                "replay": True,
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    async def begin_assignment_cancel(
+        self, *, assignment_id, lease_token, error_code, teardown_backend, teardown_identity,
+    ) -> dict:
+        start = self.assignment_starts[assignment_id]
+        if start["phase"] != "launching" or start["lease_token"] != lease_token:
+            raise AssignmentLeaseLost(assignment_id)
+        if not teardown_backend or not teardown_identity:
+            raise AssignmentLeaseLost(assignment_id)
+        start["phase"] = "cancel_pending"
+        start["teardown_backend"] = teardown_backend
+        start["teardown_identity"] = teardown_identity
+        start["phase_updated_at"] = datetime.now(timezone.utc)
+        start["last_error_code"] = error_code[:64]
+        return {**dict(start), "meeting": dict(self._meetings[start["meeting_id"]])}
+
+    async def complete_assignment_cancel(self, *, assignment_id, lease_token) -> None:
+        start = self.assignment_starts[assignment_id]
+        if start["phase"] != "cancel_pending" or start["lease_token"] != lease_token:
+            raise AssignmentLeaseLost(assignment_id)
+        if start["teardown_confirmed_at"] is None:
+            raise AssignmentLifecycleUnconfirmed(assignment_id)
+        if self._meetings[start["meeting_id"]]["status"] not in _TERMINAL_STATUSES:
+            raise AssignmentLifecycleUnconfirmed(assignment_id)
+        now = datetime.now(timezone.utc)
+        start["phase"] = "cancelled"
+        start["phase_updated_at"] = now
+        start["lease_token"] = None
+        start["lease_until"] = None
+
+    async def record_assignment_teardown(self, *, assignment_id, lease_token) -> None:
+        start = self.assignment_starts[assignment_id]
+        if start["phase"] != "cancel_pending" or start["lease_token"] != lease_token:
+            raise AssignmentLeaseLost(assignment_id)
+        start["teardown_confirmed_at"] = datetime.now(timezone.utc)
+
+    async def record_assignment_error(
+        self, *, assignment_id, user_id, error_code,
+    ) -> None:
+        start = self.assignment_starts.get(assignment_id)
+        if start is not None and start["user_id"] == user_id:
+            start["last_error_code"] = error_code[:64]
 
     async def list_scheduled_meetings(self) -> list:
         return [
@@ -445,6 +672,12 @@ class InMemoryMeetingRepo:
             row = self._meetings.get(mid)
             if row is None or row["status"] not in non_terminal:
                 continue
+            if any(
+                start["meeting_id"] == mid
+                and start["phase"] in ("reserved", "launching", "cancel_pending")
+                for start in self.assignment_starts.values()
+            ):
+                continue
             upd = row.get("updated_at")
             try:
                 u = datetime.fromisoformat(str(upd).replace("Z", "+00:00")) if upd else None
@@ -484,6 +717,7 @@ class FakeRuntimeClient:
         self._dead_on_arrival = dead_on_arrival
         self.specs: list[dict] = []  # every spawned spec, for assertions
         self.deleted: list[str] = []  # workload ids torn down (ROB3 compensation), for assertions
+        self.attested_deleted: list[tuple[str, str, str]] = []
         # Liveness map for the reconcile sweep: workload_id -> status dict ({"state": ...}). A workload
         # ABSENT from this map is treated as GONE (404 → None) by ``get_workload``. ``None`` defaults to
         # "every workload is alive and running" (back-compat for tests that don't care about liveness).
@@ -497,7 +731,11 @@ class FakeRuntimeClient:
             raise SpawnFailed("kernel could not start the workload")
         if self._dead_on_arrival:
             return {"workloadId": spec["workloadId"], "state": "stopped", "stopReason": "start_failed"}
-        return {"workloadId": spec["workloadId"], "state": "starting"}
+        return {
+            "workloadId": spec["workloadId"],
+            "state": "running",
+            "startedAt": "2026-06-20T09:00:01Z",
+        }
 
     async def delete_workload(self, workload_id: str) -> None:
         # Mirrors the HTTP adapter: an id the kernel doesn't track raises WorkloadUnknown (404).
@@ -517,3 +755,22 @@ class FakeRuntimeClient:
         if self._workloads is None:
             return {"workloadId": workload_id, "state": "running"}
         return self._workloads.get(workload_id)
+
+    async def get_teardown_identity(self, workload_id: str) -> dict:
+        return {"backend": "docker", "identity": f"immutable:{workload_id}"}
+
+    async def probe_claimed_workload(self, workload_id: str, *, claim_hash: str) -> dict:
+        workload = None if self._workloads is None else self._workloads.get(workload_id)
+        if workload is None:
+            return {"backend": "docker", "neverStarted": True}
+        return {
+            "backend": "docker", "identity": f"immutable:{workload_id}",
+            "state": workload.get("state"), "startedAt": workload.get("startedAt"),
+        }
+
+    async def delete_workload_attested(
+        self, workload_id: str, *, backend: str, identity: str, claim_hash: str,
+    ) -> None:
+        self.attested_deleted.append((workload_id, backend, identity))
+        if self._workloads is not None:
+            self._workloads.pop(workload_id, None)

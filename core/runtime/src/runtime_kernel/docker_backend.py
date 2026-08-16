@@ -13,12 +13,19 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Optional
 from urllib.parse import quote
 
 import requests_unixsocket
 
-from .backend import WorkloadHandle
+from .backend import (
+    SPEC_HASH_LABEL,
+    WORKLOAD_CLAIM_ENV,
+    WORKLOAD_CLAIM_LABEL,
+    WorkloadHandle,
+    launch_spec_hash,
+)
 from .mounts import workspace_binds
 from .profiles import Runnable
 
@@ -130,6 +137,23 @@ class DockerBackend:
     def _image_exists(self, ref: str) -> bool:
         r = self._req("GET", f"/images/{ref}/json")
         return r.status_code == 200
+
+    def _confirmed_started_at(self, container_id: str) -> str:
+        deadline = time.monotonic() + max(
+            0.1, float(os.getenv("RUNTIME_DOCKER_START_CONFIRM_TIMEOUT_SEC", "10")),
+        )
+        while True:
+            inspected = self._req("GET", f"/containers/{container_id}/json")
+            if inspected.status_code == 200:
+                state = (inspected.json() or {}).get("State") or {}
+                started_at = state.get("StartedAt")
+                if started_at and not str(started_at).startswith("0001-"):
+                    return str(started_at)
+                if state.get("Status") in ("exited", "dead"):
+                    raise RuntimeError("docker workload became terminal before start was proven")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("docker workload start timestamp is unconfirmed")
+            time.sleep(0.05)
 
     def ensure_worker_image(self, target: str) -> str:
         """Ensure ``target`` (the agent-worker image) is PRESENT on the daemon, PULLING it from its
@@ -246,19 +270,61 @@ class DockerBackend:
             if value and key not in spawn_env:
                 spawn_env[key] = value
 
+        spec_hash = launch_spec_hash(
+            runnable,
+            spawn_env,
+            substrate={"hostConfig": host_config},
+        )
         payload: dict[str, Any] = {
             "Image": runnable.image,
             "Env": [f"{k}={v}" for k, v in spawn_env.items()],
-            "Labels": {MANAGED_LABEL: "true", WORKLOAD_ID_LABEL: workload_id, **worker_labels},
+            "Labels": {
+                MANAGED_LABEL: "true",
+                WORKLOAD_ID_LABEL: workload_id,
+                SPEC_HASH_LABEL: spec_hash,
+                **(
+                    {WORKLOAD_CLAIM_LABEL: spawn_env[WORKLOAD_CLAIM_ENV][:52]}
+                    if WORKLOAD_CLAIM_ENV in spawn_env else {}
+                ),
+                **worker_labels,
+            },
             "HostConfig": host_config,
         }
         if runnable.command:
             payload["Cmd"] = list(runnable.command)
 
         r = self._req("POST", f"/containers/create?name={name}", json=payload)
-        if r.status_code == 409:  # stale container with this name — replace it
-            self._req("DELETE", f"/containers/{name}?force=true")
-            r = self._req("POST", f"/containers/create?name={name}", json=payload)
+        if r.status_code == 409:
+            # Another runtime replica may have won the deterministic-name race.  Never delete the
+            # name occupant: inspect proves both ownership and the complete launch commitment before
+            # attaching.  This is the distributed single-flight primitive supplied by Docker.
+            existing = self._req("GET", f"/containers/{name}/json")
+            if existing.status_code != 200:
+                raise RuntimeError(f"docker create {name} conflicted and ownership is unverifiable")
+            body = existing.json() or {}
+            labels = (body.get("Config") or {}).get("Labels") or {}
+            if (
+                labels.get(MANAGED_LABEL) != "true"
+                or labels.get(WORKLOAD_ID_LABEL) != workload_id
+                or labels.get(SPEC_HASH_LABEL) != spec_hash
+                or not _in_stack_network(_stack_network(), body)
+            ):
+                raise RuntimeError(f"docker create {name} conflicted with a foreign workload")
+            cid = body.get("Id") or name
+            state = (body.get("State") or {}).get("Status")
+            if state == "created":
+                s = self._req("POST", f"/containers/{cid}/start")
+                if s.status_code not in (204, 304):
+                    raise RuntimeError(f"docker attach {name} failed ({s.status_code})")
+            elif state not in ("running", "restarting"):
+                # An exited winner proves the assignment already ran.  Restarting it here would
+                # execute the same external assignment twice; reconciliation consumes its ledger.
+                raise RuntimeError(f"docker create {name} conflicted with a terminal workload")
+            return WorkloadHandle(
+                id=workload_id,
+                impl=cid,
+                started_at=self._confirmed_started_at(cid),
+            )
         if r.status_code not in (200, 201):
             raise RuntimeError(f"docker create {name} failed ({r.status_code}): {r.text.strip()}")
         cid = r.json().get("Id", name)
@@ -266,9 +332,15 @@ class DockerBackend:
         s = self._req("POST", f"/containers/{cid}/start")
         if s.status_code not in (204, 304):
             raise RuntimeError(f"docker start {name} failed ({s.status_code}): {s.text.strip()}")
-        return WorkloadHandle(id=workload_id, impl=name)
+        return WorkloadHandle(
+            id=workload_id,
+            impl=cid,
+            started_at=self._confirmed_started_at(cid),
+        )
 
-    def find(self, workload_id: str) -> Optional[WorkloadHandle]:
+    def find(
+        self, workload_id: str, *, claim_hash: Optional[str] = None,
+    ) -> Optional[WorkloadHandle]:
         """Re-derive a live handle for a workload whose in-process handle was lost (restart): the
         container name is deterministic (``prefix + leaf``), so an inspect proves it still exists.
         Returns ``None`` when the substrate has no such container (any state counts as found —
@@ -279,11 +351,61 @@ class DockerBackend:
         foreign stack's live bot."""
         name = self._cname(workload_id)
         r = self._req("GET", f"/containers/{name}/json")
-        if r.status_code != 200:
+        if r.status_code == 404:
             return None
-        if not _in_stack_network(_stack_network(), r.json() or {}):
+        if r.status_code != 200:
+            raise RuntimeError("docker workload identity lookup failed")
+        body = r.json() or {}
+        if not _in_stack_network(_stack_network(), body):
             return None  # exists, but it is ANOTHER stack's container — not ours to touch
-        return WorkloadHandle(id=workload_id, impl=name)
+        if claim_hash is not None:
+            labels = (body.get("Config") or {}).get("Labels") or {}
+            if (
+                labels.get(MANAGED_LABEL) != "true"
+                or labels.get(WORKLOAD_ID_LABEL) != workload_id
+                or labels.get(WORKLOAD_CLAIM_LABEL) != claim_hash[:52]
+            ):
+                return None
+        immutable_id = body.get("Id")
+        if claim_hash is not None and not immutable_id:
+            return None
+        return WorkloadHandle(id=workload_id, impl=immutable_id or name)
+
+    def probe_claimed(self, workload_id: str, claim_hash: str) -> dict:
+        """Inspect the deterministic name without relying on the runtime registry."""
+        name = self._cname(workload_id)
+        r = self._req("GET", f"/containers/{name}/json")
+        if r.status_code == 404:
+            return {"neverStarted": True, "backend": self.name}
+        if r.status_code != 200:
+            raise RuntimeError("docker claimed workload probe failed")
+        body = r.json() or {}
+        labels = (body.get("Config") or {}).get("Labels") or {}
+        if (
+            not _in_stack_network(_stack_network(), body)
+            or labels.get(MANAGED_LABEL) != "true"
+            or labels.get(WORKLOAD_ID_LABEL) != workload_id
+            or labels.get(WORKLOAD_CLAIM_LABEL) != claim_hash[:52]
+        ):
+            raise RuntimeError("docker deterministic name is occupied by a foreign workload")
+        identity = body.get("Id")
+        if not identity:
+            raise RuntimeError("docker claimed workload identity is unavailable")
+        state = body.get("State") or {}
+        started_at = state.get("StartedAt")
+        if not started_at or str(started_at).startswith("0001-"):
+            started_at = None
+        substrate_state = str(state.get("Status") or "").lower()
+        logical_state = (
+            "running" if state.get("Running")
+            else "starting" if substrate_state in ("created", "restarting")
+            else "stopped"
+        )
+        return {
+            "backend": self.name, "identity": str(identity),
+            "state": logical_state,
+            "startedAt": str(started_at) if started_at else None,
+        }
 
     def list_workload_containers(self) -> list[dict]:
         """Discover the workload containers THIS backend spawned — running or exited — for boot
@@ -297,7 +419,8 @@ class DockerBackend:
         live bots. When the stack network is configured, both passes additionally filter on it —
         only containers attached to THIS stack's compose network are ever adopted.
 
-        Returns ``[{workload_id, name, running, exit_code, started_at}, …]``; never raises."""
+        Each row carries the immutable container-ID handle and assignment claim captured in the
+        same daemon snapshot; adoption never performs a later name lookup. Never raises."""
         found: dict[str, dict] = {}
         network = _stack_network()
         try:
@@ -337,13 +460,30 @@ class DockerBackend:
         """Shape one /containers/json entry as an adoption record for the kernel."""
         name = self._cname(workload_id)
         running = c.get("State") == "running"
+        labels = c.get("Labels") or {}
+        immutable_id = c.get("Id")
         return {
             "workload_id": workload_id,
             "name": name,
+            "handle": (
+                WorkloadHandle(id=workload_id, impl=immutable_id)
+                if immutable_id else None
+            ),
+            "claim_hash": labels.get(WORKLOAD_CLAIM_LABEL),
             "running": running,
             # /containers/json has no exit code — inspect only the exited ones.
             "exit_code": None if running else self._exit_from_inspect(name),
+            "started_at": self._started_at_from_inspect(name),
         }
+
+    def _started_at_from_inspect(self, name: str) -> Optional[str]:
+        r = self._req("GET", f"/containers/{name}/json")
+        if r.status_code != 200:
+            return None
+        started_at = ((r.json() or {}).get("State") or {}).get("StartedAt")
+        if not started_at or str(started_at).startswith("0001-"):
+            return None
+        return str(started_at)
 
     def exit_code(self, h: WorkloadHandle) -> Optional[int]:
         return self._exit_from_inspect(h._impl)  # type: ignore[attr-defined]
@@ -376,3 +516,29 @@ class DockerBackend:
             raise RuntimeError(
                 f"docker delete {h._impl} failed ({r.status_code}): {r.text.strip()[:200]}"
             )
+
+    def teardown_identity(self, h: WorkloadHandle) -> str:
+        identity = h._impl  # type: ignore[attr-defined]
+        if not isinstance(identity, str) or not identity:
+            raise RuntimeError("docker immutable container identity is unavailable")
+        return identity
+
+    def cleanup_identity(self, workload_id: str, identity: str, claim_hash: str) -> None:
+        # The HTTP caller cannot turn this into an arbitrary Docker DELETE. Inspect the immutable ID
+        # itself and bind it to this stack, workload and public assignment commitment first.
+        current = self._req("GET", f"/containers/{identity}/json")
+        if current.status_code == 404:
+            return
+        if current.status_code != 200:
+            raise RuntimeError("docker attested identity is unverifiable")
+        body = current.json() or {}
+        labels = (body.get("Config") or {}).get("Labels") or {}
+        if (
+            body.get("Id") != identity
+            or labels.get(MANAGED_LABEL) != "true"
+            or labels.get(WORKLOAD_ID_LABEL) != workload_id
+            or labels.get(WORKLOAD_CLAIM_LABEL) != claim_hash[:52]
+            or not _in_stack_network(_stack_network(), body)
+        ):
+            raise RuntimeError("docker attested identity does not belong to this workload")
+        self.cleanup(WorkloadHandle(id=workload_id, impl=identity))

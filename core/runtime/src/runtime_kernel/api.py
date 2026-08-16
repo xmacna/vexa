@@ -28,6 +28,16 @@ class StopBody(BaseModel):
     reason: Optional[StopReason] = None
 
 
+class AttestedTeardownBody(BaseModel):
+    backend: str
+    identity: str
+    claimHash: str
+
+
+class ClaimedProbeBody(BaseModel):
+    claimHash: str
+
+
 def _queue_deliver(rt: Runtime, queue: CallbackQueue) -> Callable[[RuntimeEvent], None]:
     """Durable delivery: enqueue each event for the workload's callbackUrl. The queue posts
     immediately and keeps anything the receiver hasn't acked, so a later sweep() retries it."""
@@ -165,6 +175,32 @@ def create_app(
             return dump(rt.destroy(workload_id))
         except KeyError:
             raise HTTPException(status_code=404, detail="unknown workload")
+
+    @app.get("/workloads/{workload_id}/teardown-identity")
+    def teardown_identity(workload_id: str):
+        try:
+            return rt.teardown_identity(workload_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown workload")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.post("/workloads/{workload_id}/attested-teardown")
+    def attested_teardown(workload_id: str, body: AttestedTeardownBody):
+        try:
+            return dump(rt.destroy_attested(
+                workload_id, backend=body.backend, identity=body.identity,
+                claim_hash=body.claimHash,
+            ))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.post("/workloads/{workload_id}/claimed-probe")
+    def claimed_probe(workload_id: str, body: ClaimedProbeBody):
+        try:
+            return rt.probe_claimed(workload_id, body.claimHash)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     # ── schedule.v1 — the durable cron over HTTP (the control plane registers routine jobs here) ──
     def _require_scheduler() -> Scheduler:

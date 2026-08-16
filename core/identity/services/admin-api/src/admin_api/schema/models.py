@@ -17,7 +17,7 @@ parent keeps the ORM classes only as a legacy READ fallback guarded by
 `to_regclass('public.recordings') IS NOT NULL`, so omitting the tables is safe.
 """
 from sqlalchemy import (
-    Column, String, Text, Integer, DateTime, Float,
+    CheckConstraint, Column, String, Text, Integer, DateTime, Float,
     ForeignKey, Index, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
@@ -166,4 +166,47 @@ class MeetingSession(Base):
 
     __table_args__ = (
         UniqueConstraint("meeting_id", "session_uid", name="_meeting_session_uc"),
+    )
+
+
+class BotStartRequest(Base):
+    """Assignment-scoped bot-start ledger shared with meeting-api."""
+
+    __tablename__ = "bot_start_requests"
+
+    assignment_id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    request_hash = Column(String(64), nullable=False)
+    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, unique=True)
+    connection_id = Column(String(36), nullable=False, unique=True)
+    workload_id = Column(String(255), nullable=False, unique=True)
+    phase = Column(String(16), nullable=False, server_default="reserved")
+    phase_updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    lease_token = Column(String(36), nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    launch_attempt = Column(Integer, nullable=False, server_default="0")
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    teardown_backend = Column(String(16), nullable=True)
+    teardown_identity = Column(String(255), nullable=True)
+    teardown_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('reserved', 'launching', 'started', 'cancel_pending', 'cancelled')",
+            name="ck_bot_start_request_phase",
+        ),
+        CheckConstraint(
+            "(teardown_backend IS NULL) = (teardown_identity IS NULL)",
+            name="ck_bot_start_request_teardown_identity",
+        ),
+        Index(
+            "ix_bot_start_request_reconcile",
+            "phase", "lease_until", "phase_updated_at",
+            postgresql_where=text(
+                "phase IN ('reserved', 'launching', 'cancel_pending')"
+            ),
+        ),
     )

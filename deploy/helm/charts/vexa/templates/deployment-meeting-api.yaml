@@ -26,6 +26,35 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.migrations.enabled }}
+      initContainers:
+        - name: assignment-schema
+          securityContext:
+            {{- toYaml .Values.global.securityContext | nindent 12 }}
+          image: "{{ .Values.meetingApi.image.repository }}:{{ .Values.global.imageTag | default .Values.meetingApi.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["python", "-m", "meeting_api.database"]
+          env:
+            - name: DB_HOST
+              value: {{ include "vexa.dbHostEffective" . | quote }}
+            - name: DB_PORT
+              value: {{ include "vexa.dbPortEffective" . | quote }}
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.postgresCredentialsSecretName" . | quote }}
+                  key: POSTGRES_DB
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.postgresCredentialsSecretName" . | quote }}
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.postgresCredentialsSecretName" . | quote }}
+                  key: POSTGRES_PASSWORD
+      {{- end }}
       containers:
         - name: meeting-api
           securityContext:

@@ -89,6 +89,23 @@ def test_authed_request_passes_body_and_status_verbatim():
     assert r.json() == {"id": 99, "platform": "google_meet"}
 
 
+def test_assignment_put_forwards_method_path_identity_and_status_verbatim():
+    assignment_id = "11111111-1111-4111-8111-111111111111"
+    downstream = FakeDownstream(status_code=201, body={"id": 99})
+    client, _ = _client(downstream=downstream)
+
+    response = client.put(
+        f"/bots/assignments/{assignment_id}",
+        headers={**AUTH, "x-user-id": "999"},
+        json={"platform": "google_meet", "bot_name": "Xmacna"},
+    )
+
+    assert response.status_code == 201
+    assert downstream.last["method"] == "PUT"
+    assert downstream.last["url"].endswith(f"/bots/assignments/{assignment_id}")
+    assert downstream.last["headers"]["x-user-id"] == "7"
+
+
 def test_range_response_preserves_content_range_headers():
     """A 206 from a recording /raw byte stream must keep its Content-Range/Accept-Ranges on the way
     out. Without them the response is a malformed 206 and browsers abort <audio>/<video> playback

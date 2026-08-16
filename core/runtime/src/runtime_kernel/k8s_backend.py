@@ -6,10 +6,20 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import subprocess
+import time
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
-from .backend import WorkloadHandle
+from .backend import (
+    SPEC_HASH_LABEL,
+    WORKLOAD_CLAIM_ENV,
+    WORKLOAD_CLAIM_LABEL,
+    WorkloadHandle,
+    launch_spec_hash,
+)
 from .mounts import k8s_volume_mounts
 from .profiles import Runnable
 
@@ -57,7 +67,10 @@ def _runtime_scheduling_env() -> dict[str, str]:
 def _kubectl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     r = subprocess.run(["kubectl", *args], capture_output=True, text=True)
     if check and r.returncode != 0:
-        raise RuntimeError(f"kubectl {' '.join(args)} failed: {r.stderr.strip()}")
+        # Args contain --env=VEXA_BOT_CONFIG=... and therefore credentials.  Keep both argv and
+        # stderr out of propagated/logged exceptions; callers only need the bounded operation name.
+        operation = args[0] if args else "operation"
+        raise RuntimeError(f"kubectl {operation} failed (exit {r.returncode})")
     return r
 
 
@@ -70,6 +83,16 @@ def _stop_grace_sec() -> int:
         return max(1, int(float(os.getenv("RUNTIME_STOP_GRACE_SEC", "30"))))
     except ValueError:
         return 30
+
+
+def _pod_started_at(body: dict) -> Optional[str]:
+    for status in (body.get("status") or {}).get("containerStatuses") or []:
+        state = status.get("state") or {}
+        for kind in ("running", "terminated"):
+            started_at = (state.get(kind) or {}).get("startedAt")
+            if started_at:
+                return str(started_at)
+    return None
 
 
 def pod_overrides(env: dict[str, str], *, container_name: str) -> Optional[dict]:
@@ -123,6 +146,81 @@ class K8sBackend:
     def _ns_args(self) -> list[str]:
         return ["-n", self._ns] if self._ns else []
 
+    def _pod_namespace(self) -> str:
+        if self._ns:
+            return self._ns
+        path = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+        try:
+            namespace = open(path, encoding="utf-8").read().strip()
+        except OSError as exc:
+            raise RuntimeError("kubernetes namespace unavailable for UID-fenced delete") from exc
+        if not namespace:
+            raise RuntimeError("kubernetes namespace unavailable for UID-fenced delete")
+        return namespace
+
+    def _delete_pod_uid(self, name: str, uid: str) -> int:
+        """DELETE one exact Pod UID through the Kubernetes API DeleteOptions precondition."""
+        host = os.getenv("KUBERNETES_SERVICE_HOST")
+        port = os.getenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        if not host:
+            raise RuntimeError("kubernetes API unavailable for UID-fenced delete")
+        try:
+            token = open(token_path, encoding="utf-8").read().strip()
+        except OSError as exc:
+            raise RuntimeError("kubernetes service-account token unavailable") from exc
+        namespace = self._pod_namespace()
+        url = f"https://{host}:{port}/api/v1/namespaces/{namespace}/pods/{name}"
+        body = json.dumps({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "gracePeriodSeconds": 0,
+            "propagationPolicy": "Background",
+            "preconditions": {"uid": uid},
+        }).encode("utf-8")
+        req = urllib_request.Request(
+            url,
+            data=body,
+            method="DELETE",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        context = ssl.create_default_context(cafile=ca_path)
+        try:
+            with urllib_request.urlopen(req, context=context, timeout=10) as response:
+                return int(response.status)
+        except urllib_error.HTTPError as exc:
+            return int(exc.code)
+
+    @staticmethod
+    def _handle_name(h: WorkloadHandle) -> str:
+        impl = h._impl  # type: ignore[attr-defined]
+        return str(impl["name"] if isinstance(impl, dict) else impl)
+
+    def _confirmed_pod(self, name: str, initial: Optional[dict] = None) -> tuple[dict, str]:
+        deadline = time.monotonic() + max(
+            0.1, float(os.getenv("RUNTIME_K8S_START_CONFIRM_TIMEOUT_SEC", "30")),
+        )
+        body = initial
+        while True:
+            if body is None:
+                current = _kubectl("get", "pod", name, "-o", "json", *self._ns_args(), check=False)
+                if current.returncode == 0:
+                    try:
+                        body = json.loads(current.stdout)
+                    except (TypeError, json.JSONDecodeError):
+                        body = None
+            if body is not None:
+                started_at = _pod_started_at(body)
+                if started_at:
+                    return body, started_at
+                if (body.get("status") or {}).get("phase") in ("Failed", "Succeeded"):
+                    raise RuntimeError("kubernetes workload became terminal without start proof")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("kubernetes workload start timestamp is unconfirmed")
+            body = None
+            time.sleep(0.05)
+
     def start(self, workload_id: str, runnable: Runnable, env: dict[str, str]) -> WorkloadHandle:
         if not runnable.image:
             raise ValueError("k8s backend requires an image")
@@ -146,17 +244,113 @@ class K8sBackend:
             args += ["--overrides", json.dumps(overrides)]
         if runnable.command:
             args += ["--command", "--", *runnable.command]
-        _kubectl(*args)
-        return WorkloadHandle(id=workload_id, impl=name)
+        spec_hash = launch_spec_hash(
+            runnable,
+            env,
+            substrate={"overrides": overrides or {}},
+        )
+        label_index = next(i for i, value in enumerate(args) if value.startswith("--labels="))
+        args[label_index] += f",{SPEC_HASH_LABEL}={spec_hash}"
+        if WORKLOAD_CLAIM_ENV in env:
+            args[label_index] += f",{WORKLOAD_CLAIM_LABEL}={env[WORKLOAD_CLAIM_ENV][:52]}"
+        attested_identity: Optional[dict] = None
+        created = _kubectl(*args, check=False)
+        if created.returncode != 0:
+            existing = _kubectl("get", "pod", name, "-o", "json", *self._ns_args(), check=False)
+            if existing.returncode != 0:
+                raise RuntimeError("kubectl run conflicted and ownership is unverifiable")
+            try:
+                body = json.loads(existing.stdout)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("kubectl run conflicted and ownership is unverifiable") from exc
+            labels = (body.get("metadata") or {}).get("labels") or {}
+            phase = (body.get("status") or {}).get("phase")
+            if (
+                labels.get(MANAGED_LABEL) != "true"
+                or labels.get(WORKLOAD_ID_LABEL) != workload_id
+                or labels.get(SPEC_HASH_LABEL) != spec_hash
+                or phase not in ("Pending", "Running")
+            ):
+                raise RuntimeError("kubectl run conflicted with a foreign or terminal workload")
+            attested_identity = body
+        attested_identity, started_at = self._confirmed_pod(name, initial=attested_identity)
+        if WORKLOAD_CLAIM_ENV in env:
+            metadata = attested_identity.get("metadata") or {}
+            labels = metadata.get("labels") or {}
+            uid = metadata.get("uid")
+            if (
+                not uid
+                or labels.get(MANAGED_LABEL) != "true"
+                or labels.get(WORKLOAD_ID_LABEL) != workload_id
+                or labels.get(SPEC_HASH_LABEL) != spec_hash
+                or labels.get(WORKLOAD_CLAIM_LABEL) != env[WORKLOAD_CLAIM_ENV][:52]
+            ):
+                raise RuntimeError("kubectl run succeeded but pod identity is unverifiable")
+            return WorkloadHandle(
+                id=workload_id, impl={"name": name, "uid": uid}, started_at=started_at,
+            )
+        return WorkloadHandle(id=workload_id, impl=name, started_at=started_at)
 
-    def find(self, workload_id: str) -> Optional[WorkloadHandle]:
+    def find(
+        self, workload_id: str, *, claim_hash: Optional[str] = None,
+    ) -> Optional[WorkloadHandle]:
         """Re-derive a handle for a workload whose in-process handle was lost (restart): the Pod
         name is deterministic (``prefix + workload_id``); an existing Pod (any phase) is found."""
         name = self._pname(workload_id)
-        r = _kubectl("get", "pod", name, "-o", "name", *self._ns_args(), check=False)
+        r = _kubectl("get", "pod", name, "-o", "json", *self._ns_args(), check=False)
         if r.returncode != 0:
-            return None
+            error = str(getattr(r, "stderr", "")).lower()
+            if "notfound" in error or "not found" in error:
+                return None
+            raise RuntimeError("kubernetes workload identity lookup failed")
+        if claim_hash is not None:
+            try:
+                labels = (json.loads(r.stdout).get("metadata") or {}).get("labels") or {}
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if (
+                labels.get(MANAGED_LABEL) != "true"
+                or labels.get(WORKLOAD_ID_LABEL) != workload_id
+                or labels.get(WORKLOAD_CLAIM_LABEL) != claim_hash[:52]
+            ):
+                return None
+        if claim_hash is not None:
+            uid = (json.loads(r.stdout).get("metadata") or {}).get("uid")
+            if not uid:
+                return None
+            return WorkloadHandle(id=workload_id, impl={"name": name, "uid": uid})
         return WorkloadHandle(id=workload_id, impl=name)
+
+    def probe_claimed(self, workload_id: str, claim_hash: str) -> dict:
+        """Inspect the deterministic Pod without relying on the runtime registry."""
+        name = self._pname(workload_id)
+        r = _kubectl("get", "pod", name, "-o", "json", *self._ns_args(), check=False)
+        if r.returncode != 0:
+            error = str(getattr(r, "stderr", "")).lower()
+            if "notfound" in error or "not found" in error:
+                return {"neverStarted": True, "backend": self.name}
+            raise RuntimeError("kubernetes claimed workload probe failed")
+        try:
+            body = json.loads(r.stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("kubernetes claimed workload probe is invalid") from exc
+        metadata = body.get("metadata") or {}
+        labels = metadata.get("labels") or {}
+        if (
+            labels.get(MANAGED_LABEL) != "true"
+            or labels.get(WORKLOAD_ID_LABEL) != workload_id
+            or labels.get(WORKLOAD_CLAIM_LABEL) != claim_hash[:52]
+        ):
+            raise RuntimeError("kubernetes deterministic name is occupied by a foreign workload")
+        uid = metadata.get("uid")
+        if not uid:
+            raise RuntimeError("kubernetes claimed workload identity is unavailable")
+        phase = (body.get("status") or {}).get("phase")
+        return {
+            "backend": self.name, "identity": str(uid),
+            "state": "starting" if phase == "Pending" else "running" if phase == "Running" else "stopped",
+            "startedAt": _pod_started_at(body),
+        }
 
     def list_workload_containers(self) -> list[dict]:
         """Discover the workload Pods THIS backend spawned — for boot re-adoption. Label-selected
@@ -188,15 +382,24 @@ class K8sBackend:
                 out.append({
                     "workload_id": wid,
                     "name": meta.get("name", self._pname(wid)),
+                    "handle": (
+                        WorkloadHandle(
+                            id=wid,
+                            impl={"name": meta.get("name", self._pname(wid)), "uid": meta["uid"]},
+                        )
+                        if meta.get("uid") else None
+                    ),
+                    "claim_hash": (meta.get("labels") or {}).get(WORKLOAD_CLAIM_LABEL),
                     "running": running,
                     "exit_code": exit_code,
+                    "started_at": _pod_started_at(pod),
                 })
             return out
         except Exception:  # noqa: BLE001 — discovery is a boot aid; it must never crash the boot
             return []
 
     def exit_code(self, h: WorkloadHandle) -> Optional[int]:
-        r = _kubectl("get", "pod", h._impl, "-o", "json", *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        r = _kubectl("get", "pod", self._handle_name(h), "-o", "json", *self._ns_args(), check=False)
         if r.returncode != 0:
             return 0                                     # gone (deleted/never-found) → no longer running
         status = json.loads(r.stdout).get("status", {})
@@ -214,13 +417,80 @@ class K8sBackend:
         return None
 
     def terminate(self, h: WorkloadHandle) -> None:      # graceful: SIGTERM + grace, then SIGKILL
-        _kubectl("delete", "pod", h._impl, f"--grace-period={_stop_grace_sec()}", "--wait=false",
-                 *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        _kubectl("delete", "pod", self._handle_name(h), f"--grace-period={_stop_grace_sec()}", "--wait=false",
+                 *self._ns_args(), check=False)
 
     def kill(self, h: WorkloadHandle) -> None:           # force: immediate SIGKILL + drop the object
-        _kubectl("delete", "pod", h._impl, "--grace-period=0", "--force", "--wait=false",
-                 *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        _kubectl("delete", "pod", self._handle_name(h), "--grace-period=0", "--force", "--wait=false",
+                 *self._ns_args(), check=False)
 
     def cleanup(self, h: WorkloadHandle) -> None:
-        _kubectl("delete", "pod", h._impl, "--ignore-not-found", "--grace-period=0", "--force",
-                 "--wait=false", *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        impl = h._impl  # type: ignore[attr-defined]
+        name = self._handle_name(h)
+        if isinstance(impl, dict):
+            uid = impl["uid"]
+            status = self._delete_pod_uid(name, uid)
+            # 409 can mean the name now belongs to a different UID. It is not success by itself:
+            # the bounded GET loop below must observe absence or a different UID.
+            if status not in (200, 202, 404, 409):
+                raise RuntimeError(f"kubernetes UID-fenced delete failed ({status})")
+        else:
+            deleted = _kubectl(
+                "delete", "pod", name, "--ignore-not-found", "--grace-period=0", "--force",
+                "--wait=false", *self._ns_args(), check=False,
+            )
+            if deleted.returncode != 0:
+                raise RuntimeError("kubectl delete failed")
+        deadline = time.monotonic() + max(
+            0.1, float(os.getenv("RUNTIME_K8S_DELETE_CONFIRM_TIMEOUT_SEC", "10")),
+        )
+        while True:
+            remaining = _kubectl("get", "pod", name, "-o", "json", *self._ns_args(), check=False)
+            if remaining.returncode != 0:
+                error = str(getattr(remaining, "stderr", "")).lower()
+                if "notfound" in error or "not found" in error:
+                    return
+                raise RuntimeError("kubernetes deletion absence is unconfirmed")
+            if isinstance(impl, dict):
+                try:
+                    remaining_uid = (json.loads(remaining.stdout).get("metadata") or {}).get("uid")
+                except (TypeError, json.JSONDecodeError):
+                    remaining_uid = None
+                if remaining_uid and remaining_uid != impl["uid"]:
+                    return  # old UID is gone; never touch the replacement
+            if time.monotonic() >= deadline:
+                raise RuntimeError("kubectl delete did not remove the attested pod before timeout")
+            time.sleep(0.05)
+
+    def teardown_identity(self, h: WorkloadHandle) -> str:
+        impl = h._impl  # type: ignore[attr-defined]
+        if not isinstance(impl, dict) or not impl.get("uid"):
+            raise RuntimeError("kubernetes immutable Pod UID is unavailable")
+        return str(impl["uid"])
+
+    def cleanup_identity(self, workload_id: str, identity: str, claim_hash: str) -> None:
+        name = self._pname(workload_id)
+        current = _kubectl("get", "pod", name, "-o", "json", *self._ns_args(), check=False)
+        if current.returncode != 0:
+            error = str(getattr(current, "stderr", "")).lower()
+            if "notfound" in error or "not found" in error:
+                return
+            raise RuntimeError("kubernetes attested identity is unverifiable")
+        try:
+            body = json.loads(current.stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("kubernetes attested identity is unverifiable") from exc
+        metadata = body.get("metadata") or {}
+        if metadata.get("uid") != identity:
+            return  # the persisted UID is absent; never touch its replacement
+        labels = metadata.get("labels") or {}
+        if (
+            labels.get(MANAGED_LABEL) != "true"
+            or labels.get(WORKLOAD_ID_LABEL) != workload_id
+            or labels.get(WORKLOAD_CLAIM_LABEL) != claim_hash[:52]
+        ):
+            raise RuntimeError("kubernetes attested identity does not belong to this workload")
+        self.cleanup(WorkloadHandle(
+            id=workload_id,
+            impl={"name": name, "uid": identity},
+        ))

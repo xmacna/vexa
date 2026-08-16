@@ -13,7 +13,10 @@ HTTP status the gateway forwards verbatim:
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+import json
 import os
+import uuid
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -27,6 +30,11 @@ from ..service_authority import (
 )
 from .env_flags import env_flag
 from .ports import (
+    AssignmentOwnerConflict,
+    AssignmentPayloadConflict,
+    AssignmentInProgress,
+    AssignmentLeaseLost,
+    AssignmentTerminalConflict,
     AuthSessionBusy,
     AuthSessionNotConfigured,
     MaxBotsExceeded,
@@ -37,7 +45,12 @@ from .ports import (
     TranscriptionNotConfigured,
 )
 from .invocation import SPAWNABLE_PLATFORMS
-from .service import DuplicateMeeting, construct_meeting_url, request_bot
+from .service import (
+    DuplicateMeeting,
+    assignment_start_response,
+    construct_meeting_url,
+    request_bot,
+)
 
 #: Max length of a native meeting id, mirroring the `meetings.platform_specific_id`
 #: varchar(255) column. Bounded at the request boundary so an over-long id is a typed
@@ -241,6 +254,7 @@ def build_router(
     """The bot-spawn routes over injected storage, runtime, and authority ports."""
     router = APIRouter()
 
+    @router.put("/bots/assignments/{assignment_id}")
     @router.post("/bots", status_code=201)
     async def create_bot(
         request: Request,
@@ -251,6 +265,14 @@ def build_router(
         x_user_webhook_events: Optional[str] = Header(default=None),
     ):
         user_id = _resolve_user_id(x_user_id)
+        assignment_id = request.path_params.get("assignment_id")
+        if assignment_id is not None:
+            try:
+                parsed_assignment = uuid.UUID(assignment_id)
+            except (ValueError, AttributeError):
+                raise HTTPException(status_code=422, detail="assignment_id must be a canonical UUID")
+            if str(parsed_assignment) != assignment_id:
+                raise HTTPException(status_code=422, detail="assignment_id must be a canonical UUID")
         max_concurrent = _resolve_max_concurrent(x_user_limits)
         # Per-user webhook config the gateway forwarded from identity (persisted into meeting.data).
         webhook_events = None
@@ -268,6 +290,20 @@ def build_router(
             raise HTTPException(status_code=422, detail="invalid JSON body")
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="body must be an object")
+        if assignment_id is not None:
+            allowed = {
+                "platform", "native_meeting_id", "meeting_url", "bot_name", "language", "task",
+                "transcription_tier", "recording_enabled", "transcribe_enabled", "automatic_leave",
+                "voice_agent_enabled",
+            }
+            unknown = sorted(set(body) - allowed)
+            if unknown:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"assignment start has unsupported field(s): {', '.join(unknown)}",
+                )
+            if not isinstance(body.get("bot_name"), str) or not body["bot_name"].strip():
+                raise HTTPException(status_code=422, detail="assignment start requires bot_name")
 
         platform = str(body.get("platform", "")).strip()
         native_meeting_id = str(body.get("native_meeting_id", "")).strip()
@@ -385,6 +421,163 @@ def build_router(
             )
 
         transcribe_enabled = _resolve_transcribe_enabled(body.get("transcribe_enabled"))
+        recording_enabled = _resolve_recording_enabled(body.get("recording_enabled"))
+        automatic_leave = _resolve_automatic_leave(body.get("automatic_leave"))
+        effective_bot_name = body.get("bot_name")
+        if assignment_id is not None:
+            effective_bot_name = body["bot_name"].strip()
+        assignment_request_hash = None
+        if assignment_id is not None:
+            canonical_request = {
+                "automatic_leave": automatic_leave,
+                "bot_name": effective_bot_name,
+                "language": body.get("language"),
+                "meeting_url": meeting_url,
+                "native_meeting_id": native_meeting_id,
+                "platform": platform,
+                "recording_enabled": recording_enabled,
+                "task": body.get("task"),
+                "transcribe_enabled": transcribe_enabled,
+                "transcription_tier": body.get("transcription_tier", "realtime"),
+                "voice_agent_enabled": body.get("voice_agent_enabled", False),
+            }
+            assignment_request_hash = hashlib.sha256(
+                json.dumps(
+                    canonical_request, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            try:
+                existing_assignment = await repo.get_assignment_start(
+                    assignment_id=assignment_id,
+                    user_id=user_id,
+                    request_hash=assignment_request_hash,
+                )
+            except AssignmentPayloadConflict:
+                raise HTTPException(
+                    status_code=409, detail={"code": "assignment_payload_conflict"},
+                )
+            except AssignmentOwnerConflict:
+                raise HTTPException(
+                    status_code=409, detail={"code": "assignment_owner_conflict"},
+                )
+            if existing_assignment is not None:
+                if existing_assignment["phase"] == "started":
+                    return JSONResponse(
+                        status_code=200,
+                        content=await assignment_start_response(repo, existing_assignment),
+                    )
+                if existing_assignment["phase"] == "cancelled":
+                    raise HTTPException(
+                        status_code=409, detail={"code": "assignment_terminal"},
+                    )
+                try:
+                    workload = await runtime.get_workload(existing_assignment["workload_id"])
+                except Exception:  # dependency fault: fail closed; never consult/change spawn config
+                    workload = None
+                workload_state = workload.get("state") if workload is not None else None
+                # Running, or a terminal record with startedAt, is durable proof that the substrate
+                # accepted the start. A persisted `starting` precedes backend.start and is not proof.
+                accepted = (
+                    workload_state in ("running", "stopped", "destroyed")
+                    and bool(workload.get("startedAt"))
+                )
+                if accepted:
+                    try:
+                        meeting = await repo.mark_assignment_started(
+                            assignment_id=assignment_id,
+                            user_id=user_id,
+                            workload_id=existing_assignment["workload_id"],
+                            lease_token=existing_assignment["lease_token"],
+                            started_at=workload["startedAt"],
+                        )
+                    except AssignmentTerminalConflict as exc:
+                        teardown = await runtime.get_teardown_identity(
+                            existing_assignment["workload_id"]
+                        )
+                        cancel = await repo.begin_assignment_cancel(
+                            assignment_id=assignment_id,
+                            lease_token=existing_assignment["lease_token"],
+                            error_code="meeting_terminal",
+                            teardown_backend=teardown["backend"],
+                            teardown_identity=teardown["identity"],
+                        )
+                        try:
+                            await runtime.delete_workload_attested(
+                                existing_assignment["workload_id"],
+                                backend=teardown["backend"],
+                                identity=teardown["identity"],
+                                claim_hash=existing_assignment["request_hash"],
+                            )
+                        except Exception as teardown_exc:
+                            raise HTTPException(
+                                status_code=502,
+                                detail="assignment became terminal but workload teardown is unconfirmed",
+                            ) from teardown_exc
+                        await repo.record_assignment_teardown(
+                            assignment_id=assignment_id,
+                            lease_token=cancel["lease_token"],
+                        )
+                        await repo.complete_assignment_cancel(
+                            assignment_id=assignment_id,
+                            lease_token=cancel["lease_token"],
+                        )
+                        raise HTTPException(
+                            status_code=409, detail={"code": "assignment_terminal"},
+                        ) from exc
+                    existing_assignment = {**existing_assignment, "meeting": meeting, "phase": "started"}
+                    return JSONResponse(
+                        status_code=200,
+                        content=await assignment_start_response(repo, existing_assignment),
+                    )
+                if workload_state in ("starting", "running"):
+                    raise HTTPException(
+                        status_code=409, detail={"code": "assignment_in_progress"},
+                    )
+                if (
+                    workload_state in ("stopped", "destroyed")
+                    and workload.get("stopReason") == "start_failed"
+                    and not workload.get("startedAt")
+                ):
+                    try:
+                        teardown = await runtime.get_teardown_identity(
+                            existing_assignment["workload_id"]
+                        )
+                        if teardown.get("neverStarted") is True:
+                            await repo.release_assignment_launch(
+                                assignment_id=assignment_id, user_id=user_id,
+                                lease_token=existing_assignment["lease_token"],
+                                error_code="runtime_start_failed", never_started=True,
+                            )
+                        else:
+                            await repo.record_assignment_teardown_identity(
+                                assignment_id=assignment_id,
+                                lease_token=existing_assignment["lease_token"],
+                                error_code="runtime_start_failed",
+                                teardown_backend=teardown["backend"],
+                                teardown_identity=teardown["identity"],
+                            )
+                            await runtime.delete_workload_attested(
+                                existing_assignment["workload_id"],
+                                backend=teardown["backend"], identity=teardown["identity"],
+                                claim_hash=existing_assignment["request_hash"],
+                            )
+                            await repo.release_assignment_launch(
+                                assignment_id=assignment_id,
+                                user_id=user_id,
+                                lease_token=existing_assignment["lease_token"],
+                                error_code="runtime_start_failed",
+                            )
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="assignment start failure cleanup is unconfirmed",
+                        ) from exc
+                if existing_assignment["meeting"].get("status") in ("completed", "failed"):
+                    raise HTTPException(
+                        status_code=409, detail={"code": "assignment_terminal"},
+                    )
+        else:
+            existing_assignment = None
 
         try:
             meeting = await request_bot(
@@ -394,15 +587,15 @@ def build_router(
                 user_id=user_id,
                 platform=platform,
                 native_meeting_id=native_meeting_id,
-                bot_name=body.get("bot_name"),
+                bot_name=effective_bot_name,
                 passcode=passcode,
                 meeting_url=meeting_url,
                 language=body.get("language"),
                 task=body.get("task"),
                 transcription_tier=body.get("transcription_tier", "realtime"),
-                recording_enabled=_resolve_recording_enabled(body.get("recording_enabled")),
+                recording_enabled=recording_enabled,
                 transcribe_enabled=transcribe_enabled,
-                automatic_leave=_resolve_automatic_leave(body.get("automatic_leave")),
+                automatic_leave=automatic_leave,
                 # P3c — continue_meeting is accepted off the OPEN api.v1 request body (MeetingCreate
                 # has no additionalProperties:false), so the wire is not rejected; documenting it as
                 # a public typed field needs a vN+1 (lane:contract) — see the bot_spawn README.
@@ -411,6 +604,9 @@ def build_router(
                 webhook_url=x_user_webhook_url,
                 webhook_secret=x_user_webhook_secret,
                 webhook_events=webhook_events,
+                assignment_id=assignment_id,
+                assignment_request_hash=assignment_request_hash,
+                assignment_reservation=existing_assignment,
             )
         except TranscriptionNotConfigured as e:
             raise HTTPException(status_code=503, detail=str(e))
@@ -441,11 +637,31 @@ def build_router(
             )
         except DuplicateMeeting as e:
             raise HTTPException(status_code=409, detail=str(e))
+        except AssignmentPayloadConflict:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "assignment_payload_conflict"},
+            )
+        except AssignmentOwnerConflict:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "assignment_owner_conflict"},
+            )
+        except AssignmentTerminalConflict:
+            raise HTTPException(
+                status_code=409, detail={"code": "assignment_terminal"},
+            )
+        except (AssignmentInProgress, AssignmentLeaseLost):
+            raise HTTPException(
+                status_code=409, detail={"code": "assignment_in_progress"},
+                headers={"Retry-After": "1"},
+            )
         except (MaxBotsExceeded, QuotaExceeded) as e:
             raise HTTPException(status_code=429, detail=str(e) or "Bot concurrency limit reached")
         except SpawnFailed as e:
             raise HTTPException(status_code=502, detail=str(e) or "Failed to start bot workload")
 
-        return JSONResponse(status_code=201, content=meeting)
+        replay = bool(meeting.pop("_assignment_replay", False))
+        return JSONResponse(status_code=200 if assignment_id is not None and replay else 201, content=meeting)
 
     return router

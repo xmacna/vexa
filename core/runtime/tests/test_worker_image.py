@@ -122,6 +122,9 @@ def test_worker_create_spec_uses_worker_image():
     routes = {
         ("POST", "/containers/create"): FakeResp(201, body={"Id": "cid123"}),
         ("POST", "/containers/cid123/start"): FakeResp(204),
+        ("GET", "/containers/cid123/json"): FakeResp(200, body={
+            "State": {"Status": "running", "StartedAt": "2026-06-20T09:00:01Z"},
+        }),
     }
     b, sess = _backend(routes)
     captured = {}
@@ -142,13 +145,16 @@ def test_worker_create_spec_uses_worker_image():
     assert captured["Labels"]["vexa.role"] == "worker"
     assert captured["Labels"]["vexa.kind"] == "chat"
     assert captured["Labels"]["runtime.workload_id"] == "agent-foo-chat"  # workload id unchanged
-    assert h._impl == "vexa-worker-foo-chat"  # cosmetic container name preserved
+    assert h._impl == "cid123"  # immutable container id fences name replacement during cleanup
 
 
 def test_worker_create_spec_injects_anthropic_route_env(monkeypatch):
     routes = {
         ("POST", "/containers/create"): FakeResp(201, body={"Id": "cid123"}),
         ("POST", "/containers/cid123/start"): FakeResp(204),
+        ("GET", "/containers/cid123/json"): FakeResp(200, body={
+            "State": {"Status": "running", "StartedAt": "2026-06-20T09:00:01Z"},
+        }),
     }
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")

@@ -121,6 +121,33 @@ def _drive_to(client: TestClient, target: str, *, connection_id: str = "c") -> N
         assert r.status_code == 200, f"setup hop {st} failed: {r.text}"
 
 
+def test_persist_failure_does_not_poison_same_process_retry():
+    class FailOnceRepo(InMemoryMeetingRepo):
+        calls = 0
+
+        async def update_meeting_status(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("postgres write lost")
+            return await super().update_meeting_status(**kwargs)
+
+    repo = FailOnceRepo()
+    meeting = _seed(repo, status="requested")
+    app = create_app(meeting_repo=repo)
+    client = TestClient(app)
+
+    first = _post(client, connection_id="sess-uid", status="joining")
+    assert first.status_code == 503
+    assert repo._meetings[meeting["id"]]["status"] == "requested"
+    assert app.state.lifecycle_sink.store.get("sess-uid").status is None
+    assert list(app.state.status_change_webhooks) == []
+
+    retry = _post(client, connection_id="sess-uid", status="joining")
+    assert retry.status_code == 200
+    assert repo._meetings[meeting["id"]]["status"] == "joining"
+    assert len(app.state.status_change_webhooks) == 1
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ 1. EVERY ILLEGAL TRANSITION → 409 with correct from/to                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
@@ -358,15 +385,13 @@ def test_bad_status_enum_is_422():
     assert r.status_code == 422, r.text
 
 
-def test_unknown_connection_id_joining_is_accepted_but_not_persisted():
-    """An UNKNOWN connection_id (no session row) with a legal first event: the FSM creates an
-    in-memory record and returns 200, but the DB persist no-ops (unknown session). This DOCUMENTS
-    the current behaviour — the callback does not 404 an unknown session."""
+def test_unknown_connection_id_joining_fails_closed_without_poisoning_fsm():
+    """An unknown session cannot be acknowledged without a durable meeting row."""
     repo = InMemoryMeetingRepo()  # no meeting/session seeded
     client = TestClient(create_app(meeting_repo=repo))
     r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "joining"})
-    assert r.status_code == 200, r.text
-    assert r.json()["meeting_status"] == "joining"
+    assert r.status_code == 503, r.text
+    assert client.app.state.lifecycle_sink.store.get("ghost") is None
     # Nothing persisted (no such session) — get_status_by_session stays None.
     assert asyncio.run(repo.get_status_by_session(session_uid="ghost")) is None
 
