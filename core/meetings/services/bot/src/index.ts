@@ -38,6 +38,13 @@ import { createSttFaultReporter } from './stt-faults.js';
 import { launchBrowser, startCaptureBridge, startRecording, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
 import { installSignalHandlers } from './signals.js';
+import {
+  createConfirmedChatHandler,
+  createHttpChatCommandApi,
+  probeConfirmedChatBridge,
+  quarantineChatSession,
+  type ConfirmedChatAct,
+} from './chat-command.js';
 import type {
   JoinDriver,
   Pipeline,
@@ -121,20 +128,61 @@ function teeActs(source: ActsSource, interactive: (act: Act) => void | Promise<v
 export function interactiveHandler(
   speak: SpeakController,
   page: Pick<BrowserSession['page'], 'evaluate'>,
+  confirmedChat?: (act: ConfirmedChatAct) => Promise<void>,
+  quarantine?: () => Promise<void>,
+  isQuarantined?: () => boolean,
+  chatTimeoutMs = 7_000,
 ): (act: Act) => Promise<void> {
-  return async (act) => {
+  let chatTail = Promise.resolve();
+  let chatQuarantined = false;
+  const fenced = (): boolean => chatQuarantined || (isQuarantined?.() ?? false);
+  const fence = async (): Promise<void> => {
+    chatQuarantined = true;
+    await quarantine?.();
+  };
+  const execute = async (act: Act): Promise<void> => {
     if (act.action === 'speak') await speak.speak(act.text, act.voice);
     else if (act.action === 'speak_stop') await speak.stop();
     else if (act.action === 'chat_send') {
-      const result = await page.evaluate(async (text: string) => {
-        const chat = ((globalThis as any).__vexaGmeetChat);
-        if (!chat?.send) return { confirmed: false, reason: 'gmeet_chat_unavailable' };
-        return chat.send(text);
-      }, act.text);
+      if (fenced()) throw new Error('chat browser session is quarantined');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let result: any;
+      try {
+        result = await Promise.race([
+          page.evaluate(async (text: string) => {
+            const chat = ((globalThis as any).__vexaGmeetChat);
+            if (!chat?.send) return { confirmed: false, reason: 'gmeet_chat_unavailable' };
+            return chat.send(text);
+          }, act.text),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('legacy chat DOM confirmation timed out')), chatTimeoutMs);
+          }),
+        ]);
+      } catch {
+        await fence();
+        throw new Error('chat_send was not confirmed: message_not_observed_after_send');
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
       if (!result?.confirmed) {
+        if (result?.reason === 'message_not_observed_after_send') {
+          await fence();
+        }
         throw new Error(`chat_send was not confirmed: ${result?.reason ?? 'unknown_reason'}`);
       }
+    } else if (act.action === 'chat_send_v2') {
+      if (fenced()) throw new Error('chat browser session is quarantined');
+      if (!confirmedChat) throw new Error('chat_send_v2 rejected: durable callback unavailable');
+      await confirmedChat(act);
     }
+  };
+  return (act) => {
+    if (act.action !== 'chat_send' && act.action !== 'chat_send_v2') return execute(act);
+    // Legacy and durable chat share one browser composer. Serializing both lanes prevents a
+    // legacy DOM readback from being mistaken for the correlated v2 command with equal text.
+    const run = chatTail.then(() => execute(act));
+    chatTail = run.catch(() => undefined);
+    return run;
   };
 }
 
@@ -192,7 +240,22 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   const liveTranscript: TranscriptSink = createRedisTranscriptSink({
     client: transcriptClient, meetingId, nativeMeetingId: inv.nativeMeetingId,
   });
-  const liveActs = createRedisActsSource({ client: actsClient, meetingId });
+  const chatApi = (
+    inv.meetingApiCallbackUrl
+    && inv.token
+    && inv.meeting_id !== undefined
+    && inv.connectionId
+  ) ? createHttpChatCommandApi({
+      callbackUrl: inv.meetingApiCallbackUrl,
+      meetingToken: inv.token,
+      meetingId: inv.meeting_id,
+      assignmentId: inv.connectionId,
+    }) : null;
+  const liveActs = createRedisActsSource({
+    client: actsClient,
+    meetingId,
+    loadPending: chatApi ? () => chatApi.pending() : undefined,
+  });
 
   // ── 2b: launch the browser + wire join / capture / recording / speak (L4-gated). ──
   // Browser-launch failure must NOT crash the root: fall back to the no-browser drivers so the
@@ -202,6 +265,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
   let acts: ActsSource = liveActs;
+  let stopForChatTimeout = (): void => {};
   const recording = inv.recordingEnabled ? createBotRecordingSink({ inv, log: (m) => console.log(`[bot] ${m}`) }) : undefined;
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
@@ -225,6 +289,14 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   const sttFaults = createSttFaultReporter();
   const speakerStreamConfig = speakerStreamConfigFromEnv(env);
   const remoteAudioActivity = createRemoteAudioActivityTap();
+  let resolveChatReadiness!: (ready: boolean) => void;
+  const chatReadiness = new Promise<boolean>((resolve) => { resolveChatReadiness = resolve; });
+  let chatReadinessSettled = false;
+  const settleChatReadiness = (ready: boolean): void => {
+    if (chatReadinessSettled) return;
+    chatReadinessSettled = true;
+    resolveChatReadiness(ready);
+  };
   const aloneSilenceWindowMs = resolveAloneSilenceWindowMs(inv.automaticLeave?.everyoneLeftTimeout, env);
   const aloneness = createSilenceAlonenessSource({ activity: remoteAudioActivity, windowMs: aloneSilenceWindowMs });
   console.log(`[bot] aloneness: silence adapter enabled (window_ms=${aloneSilenceWindowMs})`);
@@ -281,7 +353,23 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
-      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
+      startCapture: async () => {
+        let stop: (() => Promise<void>) | undefined;
+        try {
+          stop = await startCaptureBridge(
+            sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity,
+          );
+          if (!(await probeConfirmedChatBridge(sess.page))) {
+            throw new Error('confirmed chat bridge was not installed');
+          }
+          settleChatReadiness(true);
+          return stop;
+        } catch (error) {
+          settleChatReadiness(false);
+          await stop?.().catch(() => undefined);
+          throw error;
+        }
+      },   // on the live meeting page
       startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
       engine: bp,
       onFault: (stage, e) => {
@@ -290,7 +378,28 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     });
     // Interactive acts: voice reaches the SpeakController; chat reaches the confirmed Meet adapter.
     const speak = createSpeakController(session.page, inv);
-    acts = teeActs(liveActs, interactiveHandler(speak, session.page));
+    let chatSessionQuarantined = false;
+    const quarantineChat = async (): Promise<void> => {
+      if (chatSessionQuarantined) return;
+      chatSessionQuarantined = true;
+      await quarantineChatSession({
+        stop: stopForChatTimeout,
+        close: () => session!.close(),
+      });
+    };
+    const confirmedChat = chatApi && inv.meeting_id !== undefined && inv.connectionId
+      ? createConfirmedChatHandler({
+          api: chatApi,
+          page: session.page,
+          meetingId: inv.meeting_id,
+          assignmentId: inv.connectionId,
+          ready: () => chatReadiness,
+          quarantine: quarantineChat,
+        })
+      : undefined;
+    acts = teeActs(liveActs, interactiveHandler(
+      speak, session.page, confirmedChat, quarantineChat, () => chatSessionQuarantined,
+    ));
   } catch (e) {
     console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);
     join = noBrowserJoinDriver(String(e));
@@ -315,6 +424,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     reachability,
     degraded: () => sttFaults.report(),
   });
+  stopForChatTimeout = () => orchestrator.stop('evicted');
 
   // Disposability (P7): a termination signal ends the active phase gracefully (leave → flush →
   // terminal callback → exit 0) so the container never hangs after `active` — BOUNDED by the

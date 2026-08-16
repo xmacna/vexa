@@ -506,7 +506,13 @@ async def request_bot(
     # transcription dies mid-meeting when the JWT expires. Default 5h; override per deployment.
     token_ttl_seconds = int(os.getenv("MEETING_TOKEN_TTL_SECONDS") or 18000)
     token = mint_meeting_token(
-        meeting_id, user_id, platform, native_meeting_id, secret=token_secret, ttl_seconds=token_ttl_seconds
+        meeting_id,
+        user_id,
+        platform,
+        native_meeting_id,
+        secret=token_secret,
+        ttl_seconds=token_ttl_seconds,
+        session_uid=connection_id,
     )
     invocation = build_invocation(
         meeting_id=meeting_id,

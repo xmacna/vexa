@@ -94,6 +94,7 @@ def mint_meeting_token(
     *,
     ttl_seconds: int = 7200,
     secret: Optional[str] = None,
+    session_uid: Optional[str] = None,
 ) -> str:
     """Mint a stateless MeetingToken (HS256 JWT), signed with ``ADMIN_TOKEN`` (or ``secret``).
 
@@ -116,6 +117,8 @@ def mint_meeting_token(
         "exp": now + ttl_seconds,
         "jti": str(uuid.uuid4()),
     }
+    if session_uid is not None:
+        payload["session_uid"] = session_uid
     header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode())
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")

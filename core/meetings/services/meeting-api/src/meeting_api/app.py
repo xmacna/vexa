@@ -166,6 +166,8 @@ def create_app(
     token_secret: Optional[str] = None,
     # user-stop (DELETE /bots) redis command publisher
     command_publisher: Optional["object"] = None,
+    # durable confirmed-chat outbox/claim/result ledger
+    chat_commands: Optional["object"] = None,
     # per-user webhook delivery sink (WebhookSink) — delivers meeting.status_change on each FSM advance
     webhook_sink: Optional["object"] = None,
     # operator-owned terminal callback — boot-frozen destination, never user/meeting input
@@ -270,8 +272,20 @@ def create_app(
     # The stop router also gets the runtime client so a stop can directly tear down a still-booting bot's
     # workload (the leave command alone is fire-and-forget — a booting bot may never receive it → orphan).
     app.include_router(build_stop_router(meeting_repo, command_publisher, runtime))
+    from .lifecycle.chat_commands import InMemoryChatCommandLedger
     from .lifecycle.chat_router import build_chat_router
-    app.include_router(build_chat_router(meeting_repo, command_publisher))
+
+    if chat_commands is None:
+        chat_commands = InMemoryChatCommandLedger()
+    app.state.chat_commands = chat_commands
+    app.include_router(
+        build_chat_router(
+            meeting_repo,
+            command_publisher,
+            chat_commands=chat_commands,
+            token_secret=token_secret,
+        )
+    )
 
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---
     if transcript_store is None:

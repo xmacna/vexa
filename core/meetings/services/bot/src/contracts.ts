@@ -91,6 +91,14 @@ export type Act =
   | { action: 'speak_audio'; url?: string; audioBase64?: string }
   | { action: 'speak_stop' }
   | { action: 'chat_send'; text: string }
+  | {
+      action: 'chat_send_v2';
+      assignmentId: string;
+      commandId: string;
+      meetingId: number;
+      payloadHash: string;
+      text: string;
+    }
   | { action: 'chat_read' }
   | { action: 'screen_show'; imageUrl?: string; text?: string }
   | { action: 'screen_stop' }
@@ -102,7 +110,7 @@ export type ActAction = Act['action'];
 export const ACT_ACTIONS: readonly ActAction[] = [
   'leave', 'reconfigure',
   'speak', 'speak_audio', 'speak_stop',
-  'chat_send', 'chat_read',
+  'chat_send', 'chat_send_v2', 'chat_read',
   'screen_show', 'screen_stop', 'avatar_set', 'avatar_reset',
 ];
 
@@ -114,6 +122,24 @@ export function parseAct(msg: unknown): Act | null {
   if (!msg || typeof msg !== 'object') return null;
   const action = (msg as { action?: unknown }).action;
   if (typeof action !== 'string' || !(ACT_ACTIONS as readonly string[]).includes(action)) return null;
+  if (action === 'chat_send_v2') {
+    const value = msg as Record<string, unknown>;
+    if (
+      Object.keys(value).sort().join(',') !==
+        'action,assignmentId,commandId,meetingId,payloadHash,text'
+      || typeof value.assignmentId !== 'string'
+      || typeof value.commandId !== 'string'
+      || typeof value.meetingId !== 'number'
+      || !Number.isSafeInteger(value.meetingId)
+      || typeof value.payloadHash !== 'string'
+      || !/^[0-9a-f]{64}$/.test(value.payloadHash)
+      || typeof value.text !== 'string'
+      || value.text.length === 0
+      || value.text.length > 10_000
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.commandId)
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.assignmentId)
+    ) return null;
+  }
   return msg as Act;
 }
 

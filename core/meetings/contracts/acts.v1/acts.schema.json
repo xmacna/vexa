@@ -5,7 +5,7 @@
   "description": "Control-plane → bot command bus over redis pub/sub (channel `bot_commands:meeting:{meeting_id}`). One JSON message per command, discriminated by `action`. Unknown actions are ignored.",
   "$defs": {
     "ActAction": {
-      "enum": ["leave", "reconfigure", "speak", "speak_audio", "speak_stop", "chat_send", "chat_read", "screen_show", "screen_stop", "avatar_set", "avatar_reset"]
+      "enum": ["leave", "reconfigure", "speak", "speak_audio", "speak_stop", "chat_send", "chat_send_v2", "chat_read", "screen_show", "screen_stop", "avatar_set", "avatar_reset"]
     },
     "Leave": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "leave" } } },
     "Reconfigure": {
@@ -16,6 +16,18 @@
     "SpeakAudio": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "speak_audio" }, "url": { "type": "string" }, "audioBase64": { "type": "string" } } },
     "SpeakStop": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "speak_stop" } } },
     "ChatSend": { "type": "object", "additionalProperties": false, "required": ["action", "text"], "properties": { "action": { "const": "chat_send" }, "text": { "type": "string" } } },
+    "ChatSendV2": {
+      "type": "object", "additionalProperties": false,
+      "required": ["action", "assignmentId", "commandId", "meetingId", "payloadHash", "text"],
+      "properties": {
+        "action": { "const": "chat_send_v2" },
+        "assignmentId": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "commandId": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "meetingId": { "type": "integer", "minimum": 1 },
+        "payloadHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 10000 }
+      }
+    },
     "ChatRead": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "chat_read" } } },
     "ScreenShow": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "screen_show" }, "imageUrl": { "type": "string" }, "text": { "type": "string" } } },
     "ScreenStop": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "screen_stop" } } },
@@ -26,7 +38,7 @@
       "oneOf": [
         { "$ref": "#/$defs/Leave" }, { "$ref": "#/$defs/Reconfigure" },
         { "$ref": "#/$defs/Speak" }, { "$ref": "#/$defs/SpeakAudio" }, { "$ref": "#/$defs/SpeakStop" },
-        { "$ref": "#/$defs/ChatSend" }, { "$ref": "#/$defs/ChatRead" },
+        { "$ref": "#/$defs/ChatSend" }, { "$ref": "#/$defs/ChatSendV2" }, { "$ref": "#/$defs/ChatRead" },
         { "$ref": "#/$defs/ScreenShow" }, { "$ref": "#/$defs/ScreenStop" },
         { "$ref": "#/$defs/AvatarSet" }, { "$ref": "#/$defs/AvatarReset" }
       ]

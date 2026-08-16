@@ -64,6 +64,21 @@ def test_db_pool_keys_declared_defaulted():
         assert by_key[key]["default"] == default
 
 
+def test_chat_outbox_interval_is_declared_and_strictly_positive(monkeypatch):
+    from meeting_api.__main__ import _positive_interval
+
+    decl = cp.load_declaration()
+    item = next(item for item in decl["keys"] if item["key"] == "CHAT_OUTBOX_INTERVAL_S")
+    assert item["class"] == "defaulted"
+    assert item["default"] == "2"
+    monkeypatch.setenv("CHAT_OUTBOX_INTERVAL_S", "0")
+    with pytest.raises(RuntimeError, match="greater than zero"):
+        _positive_interval("CHAT_OUTBOX_INTERVAL_S", "2")
+    monkeypatch.setenv("CHAT_OUTBOX_INTERVAL_S", "nan")
+    with pytest.raises(RuntimeError, match="finite"):
+        _positive_interval("CHAT_OUTBOX_INTERVAL_S", "2")
+
+
 # ── boot preflight (A4, now declaration-driven) ──────────────────────────────────────────────────
 
 

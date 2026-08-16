@@ -338,6 +338,13 @@
    "targets": []
   },
   {
+   "key": "CHAT_OUTBOX_INTERVAL_S",
+   "class": "defaulted",
+   "default": "2",
+   "description": "durable chat-command outbox sweep cadence in seconds; must be finite and greater than zero",
+   "targets": []
+  },
+  {
    "key": "SCHEDULER_TICK_INTERVAL",
    "class": "defaulted",
    "default": "1",

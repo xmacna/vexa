@@ -192,3 +192,69 @@ class BotStartRequest(Base):
             ),
         ),
     )
+
+
+class BotChatCommand(Base):
+    """Durable command/outbox and DOM-result tombstone; contains no bearer or claim plaintext."""
+
+    __tablename__ = "bot_chat_commands"
+
+    command_id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    assignment_id = Column(
+        String(36), ForeignKey("bot_start_requests.assignment_id"), nullable=False, index=True,
+    )
+    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    platform = Column(String(32), nullable=False)
+    native_meeting_id = Column(String(255), nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+    text = Column(Text, nullable=False)
+    phase = Column(String(16), nullable=False, server_default="pending")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    last_publish_at = Column(DateTime(timezone=True), nullable=True)
+    publish_attempt = Column(Integer, nullable=False, server_default="0")
+    publish_lease_token = Column(String(36), nullable=True)
+    publish_lease_until = Column(DateTime(timezone=True), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    claim_deadline = Column(DateTime(timezone=True), nullable=True)
+    claim_token_hash = Column(String(64), nullable=True)
+    claimant_id_hash = Column(String(64), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    result_reason = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pending', 'claimed', 'confirmed', 'failed', 'indeterminate', 'expired')",
+            name="ck_bot_chat_command_phase",
+        ),
+        CheckConstraint("char_length(payload_hash) = 64", name="ck_bot_chat_command_payload_hash"),
+        CheckConstraint("char_length(text) BETWEEN 1 AND 10000", name="ck_bot_chat_command_text"),
+        CheckConstraint(
+            "(claimed_at IS NULL AND claim_deadline IS NULL AND claim_token_hash IS NULL "
+            "AND claimant_id_hash IS NULL) OR "
+            "(claimed_at IS NOT NULL AND claim_deadline IS NOT NULL AND claim_token_hash IS NOT NULL "
+            "AND claimant_id_hash IS NOT NULL)",
+            name="ck_bot_chat_command_claim_material",
+        ),
+        CheckConstraint(
+            "(publish_lease_token IS NULL) = (publish_lease_until IS NULL)",
+            name="ck_bot_chat_command_publish_lease",
+        ),
+        CheckConstraint(
+            "(phase IN ('pending', 'claimed') AND completed_at IS NULL) OR "
+            "(phase IN ('confirmed', 'failed', 'indeterminate', 'expired') AND completed_at IS NOT NULL)",
+            name="ck_bot_chat_command_completion",
+        ),
+        CheckConstraint(
+            "result_reason IS NULL OR result_reason IN ("
+            "'gmeet_chat_unavailable', 'chat_destroyed', 'composer_not_found', 'empty_message', "
+            "'message_not_observed_after_send', 'command_expired_before_claim', "
+            "'meeting_terminal_before_claim', 'meeting_terminal_after_claim', 'claim_timed_out', "
+            "'meeting_not_active_before_claim', 'meeting_not_active_after_claim')",
+            name="ck_bot_chat_command_result_reason",
+        ),
+        Index("ix_bot_chat_command_outbox", "phase", "last_publish_at", "created_at"),
+        Index("ix_bot_chat_command_claim_timeout", "phase", "claim_deadline"),
+    )

@@ -26,10 +26,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 
 log = logging.getLogger("meeting_api.entrypoint")
+
+
+def _positive_interval(key: str, default: str) -> float:
+    raw = os.getenv(key, default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{key} must be a finite number greater than zero") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{key} must be a finite number greater than zero")
+    return value
 
 
 def _database_url() -> str:
@@ -97,6 +109,9 @@ def build_production_app():
     transcript_store = SqlAlchemyTranscriptStore(session_factory, redis_client=redis_client)
     segment_bus = RedisStreamBus(redis_client)
     meeting_repo = SqlAlchemyMeetingRepo(session_factory)
+    from .lifecycle.chat_commands import SqlAlchemyChatCommandLedger
+
+    chat_commands = SqlAlchemyChatCommandLedger(session_factory)
 
     import httpx
 
@@ -194,6 +209,7 @@ def build_production_app():
         # The user-stop route (DELETE /bots) publishes the bot's `leave` command on redis pub/sub.
         # redis.asyncio's client satisfies the CommandPublisher port directly (async publish()).
         command_publisher=redis_client,
+        chat_commands=chat_commands,
         webhook_sink=webhook_sink,
         system_webhook_sink=system_webhook_sink,
         delivery_ledger=delivery_ledger,
@@ -209,6 +225,7 @@ def build_production_app():
         session_factory=session_factory,
         storage=storage,
         engine=engine,
+        chat_commands=chat_commands,
     )
     return app
 
@@ -225,7 +242,7 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
-    engine=None,
+    engine=None, chat_commands=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
 
@@ -296,6 +313,24 @@ def _attach_background_loops(
     service_authority_interval = float(
         os.getenv("SERVICE_AUTHORITY_SWEEP_INTERVAL_S", "15")
     )
+    chat_outbox_interval = _positive_interval("CHAT_OUTBOX_INTERVAL_S", "2")
+
+    async def _chat_outbox_loop() -> None:
+        if chat_commands is None or redis_client is None:
+            return
+        from .lifecycle.chat_commands import republish_chat_commands
+
+        while True:
+            try:
+                _sent, failed = await republish_chat_commands(chat_commands, redis_client)
+                if failed:
+                    log.warning("chat command outbox publish failures=%s", failed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("chat command outbox tick failed")
+            ticks["chat-outbox"] = _time.monotonic()
+            await asyncio.sleep(chat_outbox_interval)
 
     # #527: per-loop liveness heartbeats. A loop hung inside an await stops stamping, so /health can
     # SEE a dead consumer that would otherwise look alive (live WS keeps flowing on a SEPARATE path —
@@ -647,11 +682,12 @@ def _attach_background_loops(
     @asynccontextmanager
     async def lifespan(_app):
         if engine is not None:
-            from .database import verify_assignment_schema
+            from .database import verify_assignment_schema, verify_chat_command_schema
 
             # A missing/skewed release migration is a startup failure, never a partially serving
             # API whose first assignment request crashes with undefined_table.
             await verify_assignment_schema(engine)
+            await verify_chat_command_schema(engine)
         tasks = [
             asyncio.create_task(_segment_consumer_loop(), name="segment-consumer"),
             asyncio.create_task(_db_writer_loop(), name="db-writer"),
@@ -663,6 +699,7 @@ def _attach_background_loops(
             ),
             asyncio.create_task(_auto_join_loop(), name="auto-join"),
             asyncio.create_task(_calendar_sync_loop(), name="calendar-sync"),
+            asyncio.create_task(_chat_outbox_loop(), name="chat-outbox"),
             asyncio.create_task(_signal_tape_janitor_loop(), name="signal-tape-janitor"),
         ]
         log.info("meeting-api background loops started: %s", [t.get_name() for t in tasks])

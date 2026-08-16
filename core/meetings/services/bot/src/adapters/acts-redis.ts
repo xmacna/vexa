@@ -27,13 +27,15 @@ export interface RedisActsSourceOptions {
   client: RedisActsClient;
   /** The meeting id whose command channel to subscribe to. */
   meetingId: string | number;
+  /** Durable v2 drain, run after SUBSCRIBE so no publish can fall into the startup gap. */
+  loadPending?: () => Promise<Act[]>;
 }
 
 /** Build the live acts source. `subscribe(handler)` SUBSCRIBEs the meeting's command channel
  *  and dispatches each schema-recognized Act to `handler`; returns an unsubscribe fn. A
  *  malformed / unknown message is logged + dropped — it never throws out of the message path. */
 export function createRedisActsSource(opts: RedisActsSourceOptions): ActsSource {
-  const { client, meetingId } = opts;
+  const { client, meetingId, loadPending } = opts;
   const channel = actsChannel(meetingId);
 
   function subscribe(handler: (act: Act) => void | Promise<void>): () => void {
@@ -54,8 +56,11 @@ export function createRedisActsSource(opts: RedisActsSourceOptions): ActsSource 
 
     // node-redis `subscribe` may be async; we don't await here (the port returns a sync
     // unsubscribe fn). Surface a subscribe failure via the error log rather than throwing.
-    void Promise.resolve(client.subscribe(channel, onMessage)).catch((e) => {
-      console.error(`[bot] acts.v1: subscribe to ${channel} failed: ${String(e)}`);
+    void Promise.resolve(client.subscribe(channel, onMessage)).then(async () => {
+      if (!loadPending) return;
+      for (const act of await loadPending()) await handler(act);
+    }).catch((e) => {
+      console.error(`[bot] command subscription/drain for ${channel} failed: ${String(e)}`);
     });
 
     return () => {

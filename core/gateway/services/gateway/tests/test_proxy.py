@@ -273,6 +273,41 @@ def test_native_chat_send_forwards_body_to_meeting_api():
     assert downstream.last["url"].endswith("/bots/google_meet/abc-defg-hij/chat")
 
 
+@pytest.mark.parametrize("method", ["put", "get"])
+def test_confirmed_chat_forwards_auth_binding_and_no_store(method):
+    command_id = "33333333-3333-4333-8333-333333333333"
+    downstream = FakeDownstream(
+        status_code=202,
+        body={"protocolVersion": 2, "commandId": command_id, "status": "pending"},
+        extra_headers={"cache-control": "no-store"},
+    )
+    client, downstream = _client(downstream=downstream)
+    request = getattr(client, method)
+    kwargs = {"headers": AUTH}
+    if method == "put":
+        kwargs["json"] = {"text": "olá"}
+    response = request(
+        f"/bots/google_meet/abc-defg-hij/chat/{command_id}", **kwargs,
+    )
+    assert response.status_code == 202
+    assert response.headers["cache-control"] == "no-store"
+    assert downstream.last["method"] == method.upper()
+    assert downstream.last["url"].endswith(
+        f"/bots/google_meet/abc-defg-hij/chat/{command_id}"
+    )
+    assert downstream.last["headers"]["x-user-id"] == "7"
+
+
+def test_confirmed_chat_without_api_key_never_reaches_meeting_api():
+    client, downstream = _client()
+    response = client.put(
+        "/bots/google_meet/abc-defg-hij/chat/33333333-3333-4333-8333-333333333333",
+        json={"text": "x"},
+    )
+    assert response.status_code == 401
+    assert downstream.last is None
+
+
 def test_recording_download_alias_forwards_to_raw():
     """#579 C3: GET /recordings/{id}/media/{mid}/download aliases to the .../raw byte route."""
     client, downstream = _client()

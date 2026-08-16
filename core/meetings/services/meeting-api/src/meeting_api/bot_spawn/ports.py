@@ -107,6 +107,10 @@ class MeetingRepo(Protocol):
         """Read and validate an existing assignment before any mutable dependency call."""
         ...
 
+    async def get_assignment_for_meeting(self, *, meeting_id: int) -> Optional[str]:
+        """Started durable assignment bound to a meeting, or ``None`` for a legacy spawn."""
+        ...
+
     async def claim_assignment_launch(
         self, *, assignment_id: str, user_id: int, request_hash: str
     ) -> dict:

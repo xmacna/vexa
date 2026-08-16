@@ -308,7 +308,7 @@ def create_app(
         # MCP transport's session binding, and a forward that eats them breaks the handshake.
         passthrough = {
             k: resp_headers[k]
-            for k in ("content-range", "accept-ranges", "content-disposition") + _MCP_HEADERS
+            for k in ("content-range", "accept-ranges", "content-disposition", "cache-control") + _MCP_HEADERS
             if k in resp_headers
         }
         return Response(
@@ -471,6 +471,22 @@ def create_app(
     @app.post("/bots/{platform}/{native_meeting_id}/chat")
     async def send_meeting_chat(platform: str, native_meeting_id: str, request: Request):
         return await _forward("POST", _meeting(f"/bots/{platform}/{native_meeting_id}/chat"), request)
+
+    @app.put("/bots/{platform}/{native_meeting_id}/chat/{command_id}")
+    async def put_confirmed_meeting_chat(
+        platform: str, native_meeting_id: str, command_id: str, request: Request,
+    ):
+        return await _forward(
+            "PUT", _meeting(f"/bots/{platform}/{native_meeting_id}/chat/{command_id}"), request,
+        )
+
+    @app.get("/bots/{platform}/{native_meeting_id}/chat/{command_id}")
+    async def get_confirmed_meeting_chat(
+        platform: str, native_meeting_id: str, command_id: str, request: Request,
+    ):
+        return await _forward(
+            "GET", _meeting(f"/bots/{platform}/{native_meeting_id}/chat/{command_id}"), request,
+        )
 
     # ---- user self-serve webhook config (main.py:1080 set_user_webhook_proxy) ----
     # Identity OWNS the config (user.data JSONB via admin-api); the gateway is the public edge for

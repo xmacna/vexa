@@ -709,6 +709,22 @@ class SqlAlchemyMeetingRepo:
                 "replay": True,
             }
 
+    async def get_assignment_for_meeting(self, *, meeting_id) -> Optional[str]:
+        from sqlalchemy import select
+
+        from ..sessions.models import BotStartRequest
+
+        async with self._session_factory() as db:
+            assignments = (
+                await db.execute(
+                    select(BotStartRequest.assignment_id).where(
+                        BotStartRequest.meeting_id == meeting_id,
+                        BotStartRequest.phase == "started",
+                    ).limit(2)
+                )
+            ).scalars().all()
+            return assignments[0] if len(assignments) == 1 else None
+
     async def mark_assignment_started(
         self, *, assignment_id, user_id, workload_id, lease_token, started_at,
     ) -> dict:

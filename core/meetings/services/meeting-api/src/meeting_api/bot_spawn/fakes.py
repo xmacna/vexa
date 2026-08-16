@@ -236,6 +236,14 @@ class InMemoryMeetingRepo:
             "replay": True,
         }
 
+    async def get_assignment_for_meeting(self, *, meeting_id):
+        assignments = [
+            assignment_id
+            for assignment_id, start in self.assignment_starts.items()
+            if start["meeting_id"] == meeting_id and start["phase"] == "started"
+        ]
+        return assignments[0] if len(assignments) == 1 else None
+
     async def mark_assignment_started(
         self, *, assignment_id, user_id, workload_id, lease_token, started_at,
     ) -> dict:
