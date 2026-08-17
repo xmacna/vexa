@@ -14,12 +14,14 @@ codec (live); the [bot](../../services/) wires it to its in-process sink (contai
 model + wire codec is [`@vexa/capture-codec`](../capture-codec/) (the SSOT).
 
 ## Surface
-`createGmeetCaptureV1` (the producer) · `createGmeetCapture` · `createGmeetSpeakers` ·
+`createGmeetCaptureV1` (the producer) · `createGmeetCapture` · `createGmeetSpeakers` · `createGmeetChat` ·
 `createPcmCaptureNode` · `GmeetChannelBinder` · `pickBoundName`. Front door: [`src/index.ts`](src/index.ts).
 
 ## Verify
 `pnpm --filter @vexa/gmeet-capture test` — `gmeet-capture.test.ts` pins the **pure cores** (no DOM):
 `pickBoundName` (a name only when exactly one tile is lit) + `GmeetChannelBinder` (energy↔glow
-correlation). The DOM capture itself (`pcm`/`audio`/`glow` scraping) is validated **live** in a real
-Meet (extension/bot) — consistent with how the lane has always been tested. `tsconfig` adds the `DOM`
-lib. Covered by `gate:node`, `gate:isolation`, `gate:exports`, `gate:readme`.
+correlation). `gmeet-chat.test.ts` runs sanitized jsdom fixtures for current and legacy chat surfaces:
+accessible panel opening, delayed-history priming, grouped sender extraction, scoped composition,
+re-render deduplication and DOM readback. Audio/glow scraping remains validated **live** in a real
+Meet (extension/bot). `tsconfig` adds the `DOM` lib. Covered by `gate:node`, `gate:isolation`,
+`gate:exports`, `gate:readme`.
