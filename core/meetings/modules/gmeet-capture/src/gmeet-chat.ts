@@ -30,8 +30,26 @@ export interface GmeetChatOptions {
 export interface GmeetChat {
   send(text: string): Promise<{ confirmed: boolean; reason?: string }>;
   destroy(): void;
-  getState(): { panelFound: boolean; primed: boolean; seen: number; recent: GmeetChatMessage[] };
+  getState(): {
+    panelFound: boolean;
+    primed: boolean;
+    composerFound: boolean;
+    seen: number;
+    recent: GmeetChatMessage[];
+  };
 }
+
+/**
+ * Browser-side timing contract. The control-plane readiness probe must outlive one opener retry
+ * plus the history quiet window and a full poll tick; see CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS in
+ * the bot composition root.
+ */
+export const GMEET_CHAT_DEFAULTS = Object.freeze({
+  pollMs: 750,
+  openRetryMs: 3_000,
+  historySettleMs: 500,
+  sendTimeoutMs: 5_000,
+});
 
 export const gmeetChatContainerSelectors = [
   '[role="log"][aria-live]',
@@ -97,6 +115,7 @@ const chatPanelLabels = new Set([
 
 const ownSenderLabels = new Set(['you', 'você', 'voce']);
 const unknownSender = 'Unknown';
+const maxPreOpenCloseAttempts = 2;
 
 const normalize = (value: string): string => value.replace(/\s+/g, ' ').trim();
 const comparable = (value: string): string => normalize(value).toLocaleLowerCase();
@@ -148,30 +167,80 @@ function queryAll(selectors: readonly string[], root: ParentNode): Element[] {
 }
 
 /**
- * Find the chat surface without depending on Meet's obfuscated panel classes. The current Meet UI
- * exposes stable `data-message-id` values but no role/list landmark around them. In that variant,
- * walk from a real message to the nearest ancestor that also owns the composer. This keeps the
- * fallback scoped to the chat surface instead of scanning the whole meeting document.
+ * Find the chat surface without depending on Meet's obfuscated panel classes. An explicit chat
+ * landmark or a panel labelled by its accessibility surface is authoritative. The observed Meet
+ * DOM can omit both. A snapshot taken immediately before clicking the opener authorizes only its
+ * newly mounted subtree. An unlabeled panel that predates this bridge must be closed and reopened
+ * to establish the same causal boundary; structure alone never authorizes a pre-existing shell.
  */
-export function findGmeetChatContainer(root: ParentNode = document): Element | null {
-  const landmark = queryFirst(gmeetChatContainerSelectors, root);
-  const composers = queryAll(inputSelectors, root);
+export function findGmeetChatContainer(
+  root: ParentNode = document,
+  elementsBeforeOpen?: ReadonlySet<Element>,
+): Element | null {
+  const composers = queryAll(inputSelectors, root).filter(isElementExposed);
   const labeledPanel = deepestElement(composers
     .map(findLabeledPanelFromComposer)
-    .filter((candidate): candidate is Element => candidate !== null));
+    .filter((candidate): candidate is Element => candidate !== null && isElementExposed(candidate)));
   if (labeledPanel) return labeledPanel;
-  if (landmark) {
-    return deepestElement(composers
-      .map((composer) => nearestSharedAncestor(landmark, composer))
-      .filter((candidate): candidate is Element => candidate !== null)) ?? landmark;
-  }
-  const messages = Array.from(root.querySelectorAll('[data-message-id]'));
-  if (messages.length && composers.length) {
-    return deepestElement(messages
-      .flatMap((message) => composers.map((composer) => nearestSharedAncestor(message, composer)))
-      .filter((candidate): candidate is Element => candidate !== null));
+  const landmark = deepestElement(queryAll(gmeetChatContainerSelectors, root)
+    .filter((landmark) => isElementExposed(landmark)
+      && composers.some((composer) => landmark.contains(composer))));
+  if (landmark) return landmark;
+  if (elementsBeforeOpen) {
+    const transitioned = findNewPanelFromOpenerTransition(root, composers, elementsBeforeOpen);
+    if (transitioned) return transitioned;
   }
   return null;
+}
+
+function isElementExposed(element: Element): boolean {
+  if (!element.isConnected) return false;
+  for (let cursor: Element | null = element; cursor; cursor = cursor.parentElement) {
+    if (cursor.hasAttribute('hidden')
+      || comparable(cursor.getAttribute('aria-hidden') ?? '') === 'true') return false;
+    const style = cursor.ownerDocument.defaultView?.getComputedStyle(cursor);
+    if (style?.display === 'none' || style?.visibility === 'hidden' || style?.visibility === 'collapse') return false;
+  }
+  return true;
+}
+
+function findNewPanelFromOpenerTransition(
+  root: ParentNode,
+  composers: Element[],
+  elementsBeforeOpen: ReadonlySet<Element>,
+): Element | null {
+  const candidates: Element[] = [];
+  for (const composer of composers) {
+    if (elementsBeforeOpen.has(composer) || !isElementExposed(composer)) continue;
+    let ancestor = composer.parentElement;
+    let newSubtreeRoot: Element | null = null;
+    let messageBoundary: Element | null = null;
+    while (ancestor && !elementsBeforeOpen.has(ancestor)) {
+      if (ancestor === document.body || ancestor === document.documentElement) break;
+      newSubtreeRoot = ancestor;
+      if (!messageBoundary && ancestor.querySelector('[data-message-id]')) messageBoundary = ancestor;
+      if (ancestor === root) break;
+      ancestor = ancestor.parentElement;
+    }
+    // With messages present, the nearest new common ancestor is the narrowest useful boundary.
+    // An empty panel has no second anchor, so its newly mounted subtree root is the only honest
+    // boundary. A composer inserted directly into an old shell yields no candidate and fails closed.
+    const candidate = messageBoundary ?? newSubtreeRoot;
+    if (candidate) candidates.push(candidate);
+  }
+  return deepestElement(candidates);
+}
+
+function snapshotElements(root: ParentNode = document): ReadonlySet<Element> {
+  const elements = new Set<Element>(Array.from(root.querySelectorAll('*')));
+  if (root instanceof Element) elements.add(root);
+  return elements;
+}
+
+function snapshotMessageIds(root: ParentNode = document): ReadonlySet<string> {
+  return new Set(Array.from(root.querySelectorAll('[data-message-id]'))
+    .map((message) => message.getAttribute('data-message-id') ?? '')
+    .filter(Boolean));
 }
 
 function findLabeledPanelFromComposer(composer: Element): Element | null {
@@ -180,7 +249,8 @@ function findLabeledPanelFromComposer(composer: Element): Element | null {
     const ownLabel = comparable(ancestor.getAttribute('aria-label') ?? '');
     if (chatPanelLabels.has(ownLabel)) return ancestor;
     const heading = Array.from(ancestor.querySelectorAll('[role="heading"], h1, h2, h3'))
-      .some((node) => chatPanelLabels.has(comparable(node.textContent ?? '')));
+      .some((node) => isElementExposed(node)
+        && chatPanelLabels.has(comparable(node.textContent ?? '')));
     if (heading) return ancestor;
   }
   return null;
@@ -201,20 +271,17 @@ function deepestElement(elements: Element[]): Element | null {
   return best;
 }
 
-function nearestSharedAncestor(first: Element, second: Element): Element | null {
-  let ancestor: Element | null = first;
-  for (let depth = 0; ancestor && depth < 12; depth++, ancestor = ancestor.parentElement) {
-    if (ancestor.contains(second)) return ancestor;
-  }
-  return null;
-}
-
 function isOpenChatLabel(rawLabel: string): boolean {
   const label = comparable(rawLabel);
   for (const expected of openChatLabels) {
     if (label === expected || label.startsWith(`${expected},`) || label.startsWith(`${expected} (`)) return true;
   }
   return false;
+}
+
+function isOpenChatControl(control: Element): boolean {
+  return control.getAttribute('aria-pressed') === 'true'
+    || control.getAttribute('aria-expanded') === 'true';
 }
 
 /** Find the accessible chat control, including Meet variants that use role=button. */
@@ -224,6 +291,7 @@ export function findGmeetChatOpener(root: ParentNode = document): HTMLElement | 
     '[role="button"][aria-label]', '[role="button"][title]',
   ].join(', ');
   for (const control of Array.from(root.querySelectorAll<HTMLElement>(selector))) {
+    if (!isElementExposed(control)) continue;
     const labels = [control.getAttribute('aria-label') ?? '', control.getAttribute('title') ?? ''];
     if (labels.some(isOpenChatLabel)) return control;
   }
@@ -231,6 +299,7 @@ export function findGmeetChatOpener(root: ParentNode = document): HTMLElement | 
 }
 
 function setInputValue(input: Element, text: string): boolean {
+  if (!isElementExposed(input)) return false;
   if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
     const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -250,9 +319,47 @@ function setInputValue(input: Element, text: string): boolean {
   return false;
 }
 
+function usableComposer(root: ParentNode): Element | null {
+  for (const input of queryAll(inputSelectors, root)) {
+    if (!isElementExposed(input)) continue;
+    if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
+      if (!input.disabled && !input.readOnly) return input;
+      continue;
+    }
+    if (input instanceof HTMLElement && input.isContentEditable
+      && input.getAttribute('aria-disabled') !== 'true') return input;
+  }
+  return null;
+}
+
+function timestampMilliseconds(value?: string): number | null {
+  if (!value) return null;
+  if (/^\d+$/.test(value)) {
+    const numeric = Number(value);
+    if (!Number.isSafeInteger(numeric)) return null;
+    return numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function containsComparableName(text: string, name: string): boolean {
+  if (!name) return false;
+  const value = comparable(text);
+  const word = (character: string | undefined): boolean => Boolean(character && /[\p{L}\p{N}_]/u.test(character));
+  for (let from = 0; from <= value.length - name.length;) {
+    const index = value.indexOf(name, from);
+    if (index < 0) return false;
+    if (!word(value[index - 1]) && !word(value[index + name.length])) return true;
+    from = index + name.length;
+  }
+  return false;
+}
+
 export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
   const log = options.log ?? (() => {});
   const botName = comparable(options.botName ?? '');
+  const botMentionName = comparable((options.botName ?? '').split(/[·—]/u, 1)[0] ?? '');
   const seenNodes = new WeakSet<Element>();
   const seenKeys = new Set<string>();
   const recent: GmeetChatMessage[] = [];
@@ -262,9 +369,16 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
   let primeStartedAt: number | null = null;
   let lastPrimeChangeAt = 0;
   let lastOpenRequestAt = 0;
+  let lastCloseRequestAt = 0;
+  let preOpenCloseAttempts = 0;
+  let elementsBeforeOpen: ReadonlySet<Element> | null = null;
+  let messageIdsBeforePreOpenRecovery: ReadonlySet<string> | null = null;
   let unavailableReported = false;
-  const openRetryMs = Math.max(0, options.openRetryMs ?? 3000);
-  const historySettleMs = Math.max(0, options.historySettleMs ?? 500);
+  const primeCutoffAt = Date.now();
+  const liveDuringPrime: GmeetChatMessage[] = [];
+  const pollMs = Math.max(1, options.pollMs ?? GMEET_CHAT_DEFAULTS.pollMs);
+  const openRetryMs = Math.max(0, options.openRetryMs ?? GMEET_CHAT_DEFAULTS.openRetryMs);
+  const historySettleMs = Math.max(0, options.historySettleMs ?? GMEET_CHAT_DEFAULTS.historySettleMs);
 
   const isOwn = (message: GmeetChatMessage): boolean => {
     const sender = comparable(message.sender);
@@ -272,24 +386,45 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
   };
 
   const ensurePanel = (): Element | null => {
-    if (panel?.isConnected) return panel;
-    panel = findGmeetChatContainer();
+    if (panel?.isConnected && isElementExposed(panel) && usableComposer(panel)) return panel;
+    panel = findGmeetChatContainer(document, elementsBeforeOpen ?? undefined);
     if (panel) {
+      elementsBeforeOpen = null;
       lastOpenRequestAt = 0;
+      lastCloseRequestAt = 0;
+      preOpenCloseAttempts = 0;
       unavailableReported = false;
       return panel;
     }
     const open = findGmeetChatOpener();
-    const alreadyOpen = open?.getAttribute('aria-pressed') === 'true'
-      || open?.getAttribute('aria-expanded') === 'true';
+    const alreadyOpen = open ? isOpenChatControl(open) : false;
     const now = Date.now();
-    if (open && !alreadyOpen && (lastOpenRequestAt === 0 || now - lastOpenRequestAt >= openRetryMs)) {
+    const awaitingOpenMount = lastOpenRequestAt !== 0 && now - lastOpenRequestAt < openRetryMs;
+    if (open && alreadyOpen && !awaitingOpenMount
+      && preOpenCloseAttempts < maxPreOpenCloseAttempts
+      && (lastCloseRequestAt === 0 || now - lastCloseRequestAt >= openRetryMs)) {
+      if (preOpenCloseAttempts === 0) messageIdsBeforePreOpenRecovery = snapshotMessageIds();
+      lastCloseRequestAt = now;
+      lastOpenRequestAt = 0;
+      preOpenCloseAttempts++;
+      elementsBeforeOpen = null;
+      open.click();
+      log('unlabeled pre-open chat panel close requested before re-opening');
+    } else if (open && !alreadyOpen
+      && (lastOpenRequestAt === 0 || now - lastOpenRequestAt >= openRetryMs)) {
+      elementsBeforeOpen = snapshotElements();
       lastOpenRequestAt = now;
+      lastCloseRequestAt = 0;
       open.click();
       log('chat panel open requested');
     }
-    panel = findGmeetChatContainer();
-    if (panel) lastOpenRequestAt = 0;
+    panel = findGmeetChatContainer(document, elementsBeforeOpen ?? undefined);
+    if (panel) {
+      elementsBeforeOpen = null;
+      lastOpenRequestAt = 0;
+      lastCloseRequestAt = 0;
+      preOpenCloseAttempts = 0;
+    }
     if (!panel && !unavailableReported) {
       unavailableReported = true;
       log('chat panel not available yet');
@@ -297,10 +432,17 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
     return panel;
   };
 
+  const deliver = (message: GmeetChatMessage): void => {
+    log(`chat ${message.sender}: ${message.text.slice(0, 60)}`);
+    try { options.onMessage(message); } catch { /* chat cannot break audio capture */ }
+  };
+
   const scan = (includeOwn = false): GmeetChatMessage[] => {
     const container = ensurePanel();
     if (!container) return [];
+    if (primed) messageIdsBeforePreOpenRecovery = null;
     const scanStartedAt = Date.now();
+    const firstPrimeScan = primeStartedAt === null;
     if (primeStartedAt === null) primeStartedAt = scanStartedAt;
     const found: GmeetChatMessage[] = [];
     let inheritedSender = '';
@@ -325,9 +467,20 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
         newlySeen++;
         recent.push(message);
         if (recent.length > 30) recent.shift();
-        if (primed && !own) {
-          log(`chat ${message.sender}: ${message.text.slice(0, 60)}`);
-          try { options.onMessage(message); } catch { /* chat cannot break audio capture */ }
+        if (primed && !own) deliver(message);
+        else if (!primed && !own) {
+          const timestamp = timestampMilliseconds(message.timestamp);
+          const directedMention = containsComparableName(message.text, botMentionName);
+          const arrivedDuringPreOpenRecovery = Boolean(message.messageId
+            && messageIdsBeforePreOpenRecovery
+            && !messageIdsBeforePreOpenRecovery.has(message.messageId));
+          if (timestamp !== null ? timestamp >= primeCutoffAt
+            : directedMention && (arrivedDuringPreOpenRecovery || !firstPrimeScan)) {
+            // Untimestamped late history and a live arrival are indistinguishable in Meet's DOM.
+            // Buffer only explicit bot mentions: one historical mention may be delivered once, but
+            // stable message keys prevent repeats and losing a new directed request is worse.
+            liveDuringPrime.push(message);
+          }
         }
       });
       break;
@@ -336,14 +489,16 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
     const quietSince = Math.max(primeStartedAt, lastPrimeChangeAt);
     if (!primed && scanStartedAt - quietSince >= historySettleMs) {
       primed = true;
+      messageIdsBeforePreOpenRecovery = null;
       log(`chat reader primed with ${seenKeys.size} existing message(s)`);
+      for (const message of liveDuringPrime.splice(0)) deliver(message);
     }
     return found;
   };
 
   // Prime existing history so joining a meeting cannot replay old questions to the agent.
   scan();
-  const poll = globalThis.setInterval(scan, options.pollMs ?? 750);
+  const poll = globalThis.setInterval(scan, pollMs);
 
   return {
     async send(rawText) {
@@ -353,14 +508,14 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
       if (!botName) return { confirmed: false, reason: 'composer_not_found' };
       const container = ensurePanel();
       if (!container) return { confirmed: false, reason: 'composer_not_found' };
-      const input = queryFirst(inputSelectors, container);
+      const input = usableComposer(container);
       if (!input || !setInputValue(input, text)) return { confirmed: false, reason: 'composer_not_found' };
       const before = scan(true).filter((message) => isOwn(message) && message.text === text).length;
       const sendButton = queryFirst(sendButtonSelectors, container) as HTMLButtonElement | null;
       if (sendButton && !sendButton.disabled) sendButton.click();
       else input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
 
-      const deadline = Date.now() + (options.sendTimeoutMs ?? 5000);
+      const deadline = Date.now() + (options.sendTimeoutMs ?? GMEET_CHAT_DEFAULTS.sendTimeoutMs);
       while (!destroyed) {
         if (Date.now() > deadline) break;
         const count = scan(true).filter((message) => isOwn(message) && message.text === text).length;
@@ -376,7 +531,14 @@ export function createGmeetChat(options: GmeetChatOptions): GmeetChat {
       globalThis.clearInterval(poll);
     },
     getState() {
-      return { panelFound: Boolean(panel?.isConnected), primed, seen: seenKeys.size, recent: recent.slice(-10) };
+      const connectedPanel = panel?.isConnected && isElementExposed(panel) ? panel : null;
+      return {
+        panelFound: Boolean(connectedPanel),
+        primed,
+        composerFound: Boolean(connectedPanel && usableComposer(connectedPanel)),
+        seen: seenKeys.size,
+        recent: recent.slice(-10),
+      };
     },
   };
 }

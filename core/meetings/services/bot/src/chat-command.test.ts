@@ -13,6 +13,7 @@ const check = (name: string, condition: boolean) => {
   console.log(`  ${condition ? '✅' : '❌'} ${name}`);
   if (!condition) failed++;
 };
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const act: Extract<Act, { action: 'chat_send_v2' }> = {
   action: 'chat_send_v2',
@@ -38,6 +39,7 @@ const dom: string[] = [];
 const page = {
   async evaluate(fn: (text: string) => Promise<unknown>, text: string) {
     (globalThis as any).__vexaGmeetChat = {
+      getState() { return { panelFound: true, primed: true, composerFound: true }; },
       async send(value: string) { dom.push(value); return { confirmed: true }; },
     };
     try { return await fn(text); }
@@ -66,7 +68,16 @@ const ambiguous = createConfirmedChatHandler({
     async claim(command) { return { status: 'claimed', claimToken: 'opaque-claim-2', command }; },
     async result(_command, result) { ambiguousEvents.push(`${result.status}:${result.reason}`); },
   },
-  page: { async evaluate() { ambiguousDomCalls++; return { confirmed: false, reason: 'message_not_observed_after_send' }; } } as any,
+  page: {
+    async evaluate(fn: (text?: string) => unknown, text?: string) {
+      (globalThis as any).__vexaGmeetChat = {
+        getState: () => ({ panelFound: true, primed: true, composerFound: true }),
+        async send() { ambiguousDomCalls++; return { confirmed: false, reason: 'message_not_observed_after_send' }; },
+      };
+      try { return await fn(text); }
+      finally { delete (globalThis as any).__vexaGmeetChat; }
+    },
+  } as any,
   meetingId: 7,
   assignmentId: act.assignmentId,
   quarantine: async () => { ambiguousQuarantines++; },
@@ -84,7 +95,16 @@ const rejected = createConfirmedChatHandler({
     ...api,
     async claim() { return { status: 'rejected' }; },
   },
-  page: { async evaluate(_fn: unknown, text: string) { rejectedDom.push(text); } } as any,
+  page: {
+    async evaluate(fn: (text?: string) => unknown, text?: string) {
+      (globalThis as any).__vexaGmeetChat = {
+        getState: () => ({ panelFound: true, primed: true, composerFound: true }),
+        async send(value: string) { rejectedDom.push(value); return { confirmed: true }; },
+      };
+      try { return await fn(text); }
+      finally { delete (globalThis as any).__vexaGmeetChat; }
+    },
+  } as any,
   meetingId: 7,
   assignmentId: act.assignmentId,
   quarantine: async () => {},
@@ -125,6 +145,154 @@ check('page probe rejection fails readiness closed', await probeConfirmedChatBri
   async evaluate() { throw new Error('context destroyed'); },
 } as any) === false);
 
+const probeState = async (adapter: unknown) => probeConfirmedChatBridge({
+  async evaluate(fn: () => boolean) {
+    (globalThis as any).__vexaGmeetChat = adapter;
+    try { return fn(); }
+    finally { delete (globalThis as any).__vexaGmeetChat; }
+  },
+} as any, { timeoutMs: 0 });
+check('send alone does not attest the confirmed chat bridge', await probeState({ async send() {} }) === false);
+check('a bridge without a panel fails readiness closed', await probeState({
+  async send() {}, getState: () => ({ panelFound: false, primed: true, composerFound: true }),
+}) === false);
+check('a bridge with unprimed history fails readiness closed', await probeState({
+  async send() {}, getState: () => ({ panelFound: true, primed: false, composerFound: true }),
+}) === false);
+check('a bridge without a scoped composer fails readiness closed', await probeState({
+  async send() {}, getState: () => ({ panelFound: true, primed: true, composerFound: false }),
+}) === false);
+check('a fully ready bridge passes readiness', await probeState({
+  async send() {}, getState: () => ({ panelFound: true, primed: true, composerFound: true }),
+}) === true);
+
+let transitionSamples = 0;
+check('readiness waits for a bounded transition to a fully usable bridge', await probeConfirmedChatBridge({
+  async evaluate(fn: () => boolean) {
+    transitionSamples++;
+    (globalThis as any).__vexaGmeetChat = {
+      async send() {},
+      getState: () => ({ panelFound: true, primed: transitionSamples >= 3, composerFound: true }),
+    };
+    try { return fn(); }
+    finally { delete (globalThis as any).__vexaGmeetChat; }
+  },
+} as any, { timeoutMs: 100, pollMs: 1, sampleTimeoutMs: 20 }) === true && transitionSamples >= 3);
+
+const defaultProbeStartedAt = Date.now();
+let slowDefaultSamples = 0;
+const defaultProbeReady = await probeConfirmedChatBridge({
+  async evaluate(fn: () => boolean) {
+    // A loaded browser on the target two-core machine can take materially longer than 250 ms to
+    // service CDP while the page adapter is concurrently retrying the Meet panel opener.
+    await wait(350);
+    slowDefaultSamples++;
+    (globalThis as any).__vexaGmeetChat = {
+      async send() {},
+      getState: () => ({
+        panelFound: Date.now() - defaultProbeStartedAt >= 3_200,
+        primed: Date.now() - defaultProbeStartedAt >= 3_700,
+        composerFound: Date.now() - defaultProbeStartedAt >= 3_200,
+      }),
+    };
+    try { return fn(); }
+    finally { delete (globalThis as any).__vexaGmeetChat; }
+  },
+} as any);
+const defaultProbeElapsed = Date.now() - defaultProbeStartedAt;
+check('default readiness budget covers a slow CDP sample plus second-opener mounting and priming',
+  defaultProbeReady && slowDefaultSamples >= 2 && defaultProbeElapsed >= 3_700 && defaultProbeElapsed < 9_000);
+
+const stuckProbeStartedAt = Date.now();
+check('a stuck page readiness sample fails closed within its bound', await probeConfirmedChatBridge({
+  async evaluate() { return new Promise(() => {}); },
+} as any, { timeoutMs: 50, sampleTimeoutMs: 10 }) === false
+  && Date.now() - stuckProbeStartedAt < 500);
+
+let slowPreclaimSamples = 0;
+let slowPreclaimClaims = 0;
+const slowPreclaim = createConfirmedChatHandler({
+  api: {
+    ...api,
+    async claim(command) {
+      slowPreclaimClaims++;
+      return { status: 'claimed', claimToken: 'slow-preclaim', command };
+    },
+  },
+  page: {
+    async evaluate(fn: (text?: string) => unknown, text?: string) {
+      if (text === undefined) {
+        await wait(350);
+        slowPreclaimSamples++;
+        (globalThis as any).__vexaGmeetChat = {
+          async send() {},
+          getState: () => ({ panelFound: true, primed: slowPreclaimSamples >= 2, composerFound: true }),
+        };
+      } else {
+        (globalThis as any).__vexaGmeetChat = {
+          getState: () => ({ panelFound: true, primed: true, composerFound: true }),
+          async send() { return { confirmed: true }; },
+        };
+      }
+      try { return await fn(text); }
+      finally { delete (globalThis as any).__vexaGmeetChat; }
+    },
+  } as any,
+  meetingId: 7,
+  assignmentId: act.assignmentId,
+  ready: async () => true,
+  quarantine: async () => {},
+});
+await slowPreclaim({ ...act, commandId: '56565656-5656-4656-8656-565656565656' });
+check('a 350 ms CDP preclaim sample retries within the aligned bound and claims exactly once',
+  slowPreclaimSamples === 2 && slowPreclaimClaims === 1);
+
+let detachedClaims = 0;
+const detachedBeforeClaim = createConfirmedChatHandler({
+  api: {
+    ...api,
+    async claim(command) { detachedClaims++; return { status: 'claimed', claimToken: 'detached', command }; },
+  },
+  page: {
+    async evaluate(fn: () => unknown) {
+      delete (globalThis as any).__vexaGmeetChat;
+      return fn();
+    },
+  } as any,
+  meetingId: 7,
+  assignmentId: act.assignmentId,
+  ready: async () => true,
+  quarantine: async () => {},
+});
+await detachedBeforeClaim({ ...act, commandId: '57575757-5757-4757-8757-575757575757' });
+check('a bridge detached before claim produces zero durable claims', detachedClaims === 0);
+
+let hiddenClaims = 0;
+let hiddenDomSends = 0;
+const hiddenBeforeClaim = createConfirmedChatHandler({
+  api: {
+    ...api,
+    async claim(command) { hiddenClaims++; return { status: 'claimed', claimToken: 'hidden', command }; },
+  },
+  page: {
+    async evaluate(fn: () => unknown) {
+      (globalThis as any).__vexaGmeetChat = {
+        getState: () => ({ panelFound: false, primed: true, composerFound: false }),
+        async send() { hiddenDomSends++; return { confirmed: true }; },
+      };
+      try { return await fn(); }
+      finally { delete (globalThis as any).__vexaGmeetChat; }
+    },
+  } as any,
+  meetingId: 7,
+  assignmentId: act.assignmentId,
+  ready: async () => true,
+  quarantine: async () => {},
+});
+await hiddenBeforeClaim({ ...act, commandId: '58585858-5858-4858-8858-585858585858' });
+check('a hidden bridge before claim produces zero durable claims and zero DOM sends',
+  hiddenClaims === 0 && hiddenDomSends === 0);
+
 const canonicalDom: string[] = [];
 const canonical = createConfirmedChatHandler({
   api: {
@@ -137,6 +305,7 @@ const canonical = createConfirmedChatHandler({
   page: {
     async evaluate(fn: (text: string) => Promise<unknown>, text: string) {
       (globalThis as any).__vexaGmeetChat = {
+        getState() { return { panelFound: true, primed: true, composerFound: true }; },
         async send(value: string) { canonicalDom.push(value); return { confirmed: true }; },
       };
       try { return await fn(text); }
@@ -204,7 +373,18 @@ const timeoutHandler = createConfirmedChatHandler({
     async claim(command) { return { status: 'claimed', claimToken: 'opaque-timeout', command }; },
     async result(_command, result) { timeoutResults.push(result.status); },
   },
-  page: { async evaluate() { return new Promise(() => {}); } } as any,
+  page: {
+    async evaluate(fn: (text?: string) => unknown, text?: string) {
+      if (text === undefined) {
+        (globalThis as any).__vexaGmeetChat = {
+          getState: () => ({ panelFound: true, primed: true, composerFound: true }), async send() {},
+        };
+        try { return await fn(); }
+        finally { delete (globalThis as any).__vexaGmeetChat; }
+      }
+      return new Promise(() => {});
+    },
+  } as any,
   meetingId: 7,
   assignmentId: act.assignmentId,
   quarantine: async () => { quarantines++; },
@@ -245,7 +425,18 @@ const lifecycleHandler = createConfirmedChatHandler({
     async claim(command) { return { status: 'claimed', claimToken: 'opaque-lifecycle', command }; },
     async result() {},
   },
-  page: { async evaluate() { return new Promise(() => {}); } } as any,
+  page: {
+    async evaluate(fn: (text?: string) => unknown, text?: string) {
+      if (text === undefined) {
+        (globalThis as any).__vexaGmeetChat = {
+          getState: () => ({ panelFound: true, primed: true, composerFound: true }), async send() {},
+        };
+        try { return await fn(); }
+        finally { delete (globalThis as any).__vexaGmeetChat; }
+      }
+      return new Promise(() => {});
+    },
+  } as any,
   meetingId: 7,
   assignmentId: act.assignmentId,
   quarantine: () => quarantineChatSession({

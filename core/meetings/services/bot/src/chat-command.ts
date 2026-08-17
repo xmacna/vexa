@@ -37,16 +37,66 @@ export async function quarantineChatSession(options: {
   }
 }
 
+/**
+ * Control-plane side of the browser timing contract. Eight seconds covers the browser adapter's
+ * default 3 s second-opener attempt, its 500 ms history quiet window, at least one 750 ms poll tick,
+ * and a slow-machine margin. A single CDP sample remains bounded independently.
+ */
+export const CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS = Object.freeze({
+  timeoutMs: 8_000,
+  pollMs: 100,
+  sampleTimeoutMs: 1_500,
+});
+
 export async function probeConfirmedChatBridge(
   page: Pick<BrowserSession['page'], 'evaluate'>,
+  options: { timeoutMs?: number; pollMs?: number; sampleTimeoutMs?: number } = {},
 ): Promise<boolean> {
-  try {
-    return await page.evaluate(
-      () => typeof ((globalThis as any).__vexaGmeetChat)?.send === 'function',
-    ) === true;
-  } catch {
-    return false;
-  }
+  const timeoutMs = Math.max(0, options.timeoutMs ?? CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.timeoutMs);
+  const pollMs = Math.max(1, options.pollMs ?? CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.pollMs);
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const remaining = Math.max(0, deadline - Date.now());
+    const sampleBudget = timeoutMs === 0
+      ? Math.max(1, options.sampleTimeoutMs ?? CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.sampleTimeoutMs)
+      : Math.min(
+        options.sampleTimeoutMs ?? CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.sampleTimeoutMs,
+        Math.max(1, remaining),
+      );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const sample = await Promise.race([
+        page.evaluate(() => {
+          const chat = ((globalThis as any).__vexaGmeetChat);
+          if (typeof chat?.send !== 'function' || typeof chat?.getState !== 'function') return false;
+          const state = chat.getState();
+          return state?.panelFound === true && state?.primed === true && state?.composerFound === true;
+        }).then((ready) => ({ kind: 'result' as const, ready })),
+        new Promise<{ kind: 'timeout'; ready: false }>((resolve) => {
+          timer = setTimeout(resolve, sampleBudget, { kind: 'timeout', ready: false });
+        }),
+      ]);
+      if (sample.ready === true) return true;
+      if (sample.kind === 'timeout') return false;
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, deadline - Date.now())));
+  } while (Date.now() <= deadline);
+  return false;
+}
+
+async function bridgeReadyBeforeClaim(
+  page: Pick<BrowserSession['page'], 'evaluate'>,
+): Promise<boolean> {
+  return probeConfirmedChatBridge(page, {
+    timeoutMs: CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.sampleTimeoutMs,
+    pollMs: CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.pollMs,
+    sampleTimeoutMs: CONFIRMED_CHAT_BRIDGE_PROBE_DEFAULTS.sampleTimeoutMs,
+  });
 }
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -195,6 +245,7 @@ export function createConfirmedChatHandler(options: {
   const execute = async (act: ConfirmedChatAct): Promise<void> => {
     if (quarantined || act.meetingId !== options.meetingId || act.assignmentId !== options.assignmentId) return;
     if (options.ready && !(await options.ready())) return;
+    if (!(await bridgeReadyBeforeClaim(options.page))) return;
     const claim = await options.api.claim(act);
     if (claim.status !== 'claimed') return;
     const canonical = claim.command;
