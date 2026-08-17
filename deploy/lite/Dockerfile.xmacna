@@ -9,10 +9,12 @@ COPY core/meetings/modules/gmeet-capture/src/ /app/core/meetings/modules/gmeet-c
 COPY core/meetings/services/bot/build-browser-utils.mjs /app/core/meetings/services/bot/build-browser-utils.mjs
 COPY core/meetings/services/bot/src/ /app/core/meetings/services/bot/src/
 COPY core/meetings/contracts/acts.v1/ /app/core/meetings/contracts/acts.v1/
-COPY core/gateway/services/gateway/src/gateway/ /app/core/gateway/services/gateway/src/gateway/
-COPY core/identity/services/admin-api/src/admin_api/ /app/core/identity/services/admin-api/src/admin_api/
-COPY core/meetings/services/meeting-api/src/meeting_api/ /app/core/meetings/services/meeting-api/src/meeting_api/
-COPY core/runtime/src/runtime_kernel/ /app/core/runtime/src/runtime_kernel/
+# The pinned lite image starts these Python services from /app/<service>/src.
+# Copying them under /app/core only leaves the base image's older code active.
+COPY core/gateway/services/gateway/src/gateway/ /app/gateway/src/gateway/
+COPY core/identity/services/admin-api/src/admin_api/ /app/admin-api/src/admin_api/
+COPY core/meetings/services/meeting-api/src/meeting_api/ /app/meeting-api/src/meeting_api/
+COPY core/runtime/src/runtime_kernel/ /app/runtime/src/runtime_kernel/
 COPY contracts.seal.json schema.seal.json /app/
 
 RUN cd /app/core/meetings/modules/gmeet-capture \
@@ -20,19 +22,23 @@ RUN cd /app/core/meetings/modules/gmeet-capture \
  && cd /app/core/meetings/services/bot \
  && /app/node_modules/.bin/tsc \
  && node build-browser-utils.mjs \
+ && cp dist/browser-utils.global.js /app/browser-utils.global.js \
  && test -s /app/core/meetings/services/bot/dist/index.js \
  && test -s /app/core/meetings/services/bot/dist/browser-utils.global.js \
+ && cmp /app/core/meetings/services/bot/dist/browser-utils.global.js /app/browser-utils.global.js \
  && grep -q 'chat_send_v2' /app/core/meetings/services/bot/dist/index.js \
- && test -s /app/core/meetings/services/meeting-api/src/meeting_api/lifecycle/chat_commands.py \
+ && grep -q 'createGmeetChat' /app/browser-utils.global.js \
+ && test -s /app/meeting-api/src/meeting_api/lifecycle/chat_commands.py \
  && grep -q 'bot_chat_commands' /app/schema.seal.json \
- && grep -q 'claimed-probe' /app/core/runtime/src/runtime_kernel/api.py \
- && grep -q 'attested-teardown' /app/core/runtime/src/runtime_kernel/api.py \
- && grep -q 'chat/{command_id}' /app/core/gateway/services/gateway/src/gateway/app.py \
+ && grep -q 'assignments/{assignment_id}' /app/meeting-api/src/meeting_api/bot_spawn/router.py \
+ && grep -q 'claimed-probe' /app/runtime/src/runtime_kernel/api.py \
+ && grep -q 'attested-teardown' /app/runtime/src/runtime_kernel/api.py \
+ && grep -q 'chat/{command_id}' /app/gateway/src/gateway/app.py \
  && python3 -m compileall -q \
-      /app/core/gateway/services/gateway/src/gateway \
-      /app/core/identity/services/admin-api/src/admin_api \
-      /app/core/meetings/services/meeting-api/src/meeting_api \
-      /app/core/runtime/src/runtime_kernel
+      /app/gateway/src/gateway \
+      /app/admin-api/src/admin_api \
+      /app/meeting-api/src/meeting_api \
+      /app/runtime/src/runtime_kernel
 
 LABEL org.opencontainers.image.source="https://github.com/xmacna/vexa" \
       org.opencontainers.image.revision="${XMACNA_SOURCE_REVISION}" \
