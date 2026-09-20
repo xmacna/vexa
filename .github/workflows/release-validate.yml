@@ -798,7 +798,7 @@ jobs:
     # Stable releases only, and only when the caller asked — an rc rehearsal or a standalone
     # harness-iteration run must never move what users pull. The two human/value gates above are
     # hard `needs` (not display): if either reds or is skipped, promote does not run.
-    if: needs.resolve.outputs.prerelease == 'false' && inputs.promote
+    if: github.repository == 'Vexa-ai/vexa' && needs.resolve.outputs.prerelease == 'false' && inputs.promote
     # The hard human gate: the `release-promote` Environment requires the owner's manual approval
     # in the Actions UI (a CI file cannot forge it). The owner approves ONLY after the witness
     # pass. This is choke point 2 of the delivery constitution, now enforced by the machinery.

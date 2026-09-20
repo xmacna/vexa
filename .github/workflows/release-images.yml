@@ -53,6 +53,8 @@ permissions:
 jobs:
   # ──────────────────────────────────────────────────────────────────────────────────────────
   preflight:
+    # The fork publishes immutable ECR releases through xmacna meetings release-vexa.
+    if: github.repository == 'Vexa-ai/vexa'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
