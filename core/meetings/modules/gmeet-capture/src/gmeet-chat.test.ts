@@ -1,4 +1,5 @@
 import { JSDOM } from 'jsdom';
+import { mock } from 'node:test';
 import {
   createGmeetChat,
   extractGmeetChatMessage,
@@ -13,6 +14,17 @@ const check = (name: string, condition: boolean, detail = '') => {
 };
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// These cases assert polling order and priming boundaries, not runner scheduling latency.
+// Advance one millisecond at a time so interval callbacks observe their own logical time.
+const withClock = (run: (advance: (ms: number) => void) => void) => {
+  mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: new Date('2026-08-16T12:00:00Z') });
+  try {
+    run((ms) => { for (let elapsed = 0; elapsed < ms; elapsed++) mock.timers.tick(1); });
+  } finally {
+    mock.timers.reset();
+  }
+};
 
 const messageHtml = (id: string, text: string, sender?: string, timestamp?: string) => `
   <div data-message-id="${id}"${timestamp ? ` data-timestamp="${timestamp}"` : ''}>
@@ -81,7 +93,7 @@ const installDom = (html: string) => {
   fixture.restore();
 }
 
-{
+withClock((advance) => {
   const fixture = installDom('<button id="retry" aria-label="Chat with everyone"></button>');
   let clicks = 0;
   fixture.document.querySelector<HTMLButtonElement>('#retry')!.onclick = () => {
@@ -92,14 +104,14 @@ const installDom = (html: string) => {
   const chat = createGmeetChat({
     botName: 'Marvin', pollMs: 5, openRetryMs: 10, historySettleMs: 0, onMessage: () => {},
   });
-  await wait(35);
+  advance(35);
   check('retries an opener click that did not produce a panel',
     clicks === 2 && chat.getState().panelFound, `${clicks}:${chat.getState().panelFound}`);
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom('<button id="default-retry" aria-label="Chat with everyone"></button>');
   let clicks = 0;
   fixture.document.querySelector<HTMLButtonElement>('#default-retry')!.onclick = () => {
@@ -113,7 +125,7 @@ const installDom = (html: string) => {
     + (GMEET_CHAT_DEFAULTS.pollMs * 3) + GMEET_CHAT_DEFAULTS.historySettleMs;
   let state = chat.getState();
   while (!(state.panelFound && state.primed && state.composerFound) && Date.now() < testDeadline) {
-    await wait(50);
+    advance(50);
     state = chat.getState();
   }
   check('default timing reaches a primed scoped composer after a second opener click',
@@ -122,7 +134,7 @@ const installDom = (html: string) => {
     `${clicks}:${JSON.stringify(state)}`);
   chat.destroy();
   fixture.restore();
-}
+});
 
 {
   const fixture = installDom(`
@@ -341,7 +353,7 @@ for (const [name, wrapper] of [
   fixture.restore();
 }
 
-{
+withClock((advance) => {
   const fixture = installDom(`
     <button id="stuck-open" aria-label="Chat with everyone" aria-pressed="true"></button>
     <div id="generic-open-app-shell">
@@ -357,15 +369,15 @@ for (const [name, wrapper] of [
   const chat = createGmeetChat({
     botName: 'Marvin', pollMs: 2, openRetryMs: 5, historySettleMs: 0, onMessage: () => {},
   });
-  await wait(25);
+  advance(25);
   check('an open opener never authorizes a generic DIV application shell without a transition',
     openerTransitions === 4 && chat.getState().panelFound === false && chat.getState().composerFound === false,
     `${openerTransitions}:${JSON.stringify(chat.getState())}`);
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(`
     <button aria-label="Chat with everyone" aria-pressed="true"></button>
     <section id="hidden-open-panel" hidden>
@@ -373,15 +385,15 @@ for (const [name, wrapper] of [
       <textarea aria-label="Send a message"></textarea>
     </section>`);
   const chat = createGmeetChat({ botName: 'Marvin', pollMs: 5, historySettleMs: 0, onMessage: () => {} });
-  await wait(10);
+  advance(10);
   check('an open opener does not authorize a hidden local composer',
     chat.getState().panelFound === false && chat.getState().composerFound === false,
     JSON.stringify(chat.getState()));
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(`
     <button id="empty-open" aria-label="Chat with everyone"></button>
     <textarea id="empty-decoy" aria-label="Send a message"></textarea>
@@ -394,49 +406,49 @@ for (const [name, wrapper] of [
   const chat = createGmeetChat({
     botName: 'Marvin', pollMs: 5, historySettleMs: 0, onMessage: () => {},
   });
-  await wait(10);
+  advance(10);
   check('accepts an initially empty unlabeled panel only when its composer is new after the opener',
     chat.getState().panelFound && chat.getState().primed && chat.getState().composerFound
       && fixture.document.querySelector<HTMLTextAreaElement>('#empty-decoy')!.value === '',
     JSON.stringify(chat.getState()));
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(`
     <div role="log" aria-live="polite">${messageHtml('landmark-only', 'History', 'Ana')}</div>
     <textarea aria-label="Send a message"></textarea>`);
   const chat = createGmeetChat({ botName: 'Marvin', pollMs: 5, historySettleMs: 0, onMessage: () => {} });
-  await wait(10);
+  advance(10);
   check('rejects a landmark whose composer is outside the detected panel',
     chat.getState().panelFound === false && chat.getState().composerFound === false);
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(panelHtml(''));
   const chat = createGmeetChat({ botName: 'Marvin', pollMs: 5, historySettleMs: 0, onMessage: () => {} });
-  await wait(10);
+  advance(10);
   check('reports the bridge ready only with panel, primed history and a scoped composer',
     chat.getState().panelFound === true && chat.getState().primed === true
       && chat.getState().composerFound === true);
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(panelHtml(''));
   fixture.document.querySelector<HTMLTextAreaElement>('textarea')!.disabled = true;
   const chat = createGmeetChat({ botName: 'Marvin', pollMs: 5, historySettleMs: 0, onMessage: () => {} });
-  await wait(10);
+  advance(10);
   check('reports a disabled scoped composer as unavailable', chat.getState().composerFound === false);
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom('<div id="chat-opener" role="button" aria-label="In-call messages"></div>');
   let openClicks = 0;
   fixture.document.querySelector<HTMLElement>('#chat-opener')!.onclick = () => {
@@ -456,7 +468,7 @@ for (const [name, wrapper] of [
     log: (line) => logs.push(line),
     onMessage: (message) => received.push(message),
   });
-  await wait(50);
+  advance(50);
   check('opens the panel from its accessible aria label', openClicks === 1, String(openClicks));
   check('does not replay history loaded asynchronously after opening the panel', received.length === 0,
     JSON.stringify(received));
@@ -465,7 +477,7 @@ for (const [name, wrapper] of [
     'beforeend',
     messageHtml('new-1', 'Marvin, responda esta nova pergunta'),
   );
-  await wait(35);
+  advance(35);
   check('captures a new message in the current Meet DOM', received.length === 1,
     JSON.stringify(received));
   check('inherits the visible sender for a grouped follow-up message', received[0]?.sender === 'Ana',
@@ -474,9 +486,9 @@ for (const [name, wrapper] of [
     && logs.some((line) => line.includes('primed')));
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom('<button id="untimestamped-open" aria-label="Chat with everyone"></button>');
   fixture.document.querySelector<HTMLElement>('#untimestamped-open')!.onclick = () => {
     fixture.document.body.insertAdjacentHTML('beforeend', panelHtml(''));
@@ -490,7 +502,7 @@ for (const [name, wrapper] of [
     botName: 'Marvin · XMACNA — transcrevendo', pollMs: 5, historySettleMs: 20,
     onMessage: (message) => received.push(message),
   });
-  await wait(55);
+  advance(55);
   check('delivers an untimestamped bot mention that arrives while history is priming exactly once',
     received.length === 1 && received[0]?.text === 'Marvin, pergunta que acabou de chegar',
     JSON.stringify(received));
@@ -498,9 +510,9 @@ for (const [name, wrapper] of [
     !received.some((message) => message.text === 'Aviso histórico comum'), JSON.stringify(received));
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom('<button id="concurrent-open" aria-label="Chat with everyone"></button>');
   const now = Date.now();
   fixture.document.querySelector<HTMLElement>('#concurrent-open')!.onclick = () => {
@@ -515,7 +527,7 @@ for (const [name, wrapper] of [
     botName: 'Marvin', pollMs: 5, historySettleMs: 20,
     onMessage: (message) => received.push(message),
   });
-  await wait(55);
+  advance(55);
   check('delivers a new timestamped message that arrives while history is priming',
     received.length === 1 && received[0]?.text === 'Marvin, pergunta que acabou de chegar',
     JSON.stringify(received));
@@ -523,9 +535,9 @@ for (const [name, wrapper] of [
     !received.some((message) => message.text.includes('histórica')), JSON.stringify(received));
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(`
     <button id="reopen" aria-label="Chat with everyone, 2 unread messages" aria-pressed="false"></button>
     ${panelHtml(messageHtml('stable-old', 'Já observada', 'Ana'))}`);
@@ -545,18 +557,18 @@ for (const [name, wrapper] of [
     botName: 'Marvin', pollMs: 5, historySettleMs: 0,
     onMessage: (message) => received.push(message),
   });
-  await wait(10);
+  advance(10);
   fixture.document.querySelector('#current-chat-surface')!.remove();
-  await wait(25);
+  advance(25);
   check('reopens the panel if Meet detaches it while the bot remains active', reopenClicks === 1,
     String(reopenClicks));
   check('does not replay stable ids after the panel is re-rendered',
     received.length === 1 && received[0]?.text === 'Nova depois da reabertura', JSON.stringify(received));
   chat.destroy();
   fixture.restore();
-}
+});
 
-{
+withClock((advance) => {
   const fixture = installDom(`
     <button id="observed-reopen" aria-label="Chat with everyone" aria-pressed="false"></button>
     <div id="observed-reopen-mount"></div>`);
@@ -578,9 +590,9 @@ for (const [name, wrapper] of [
     botName: 'Marvin', pollMs: 5, historySettleMs: 0,
     onMessage: (message) => received.push(message),
   });
-  await wait(10);
+  advance(10);
   fixture.document.querySelector('#observed-reopened-1')!.remove();
-  await wait(25);
+  advance(25);
   check('re-authorizes an unlabeled panel from a fresh opener transition after cached detach',
     reopenClicks === 2 && chat.getState().panelFound && chat.getState().composerFound,
     `${reopenClicks}:${JSON.stringify(chat.getState())}`);
@@ -588,7 +600,7 @@ for (const [name, wrapper] of [
     received.length === 1 && received[0]?.text === 'Nova depois da reabertura', JSON.stringify(received));
   chat.destroy();
   fixture.restore();
-}
+});
 
 {
   const fixture = installDom(`
