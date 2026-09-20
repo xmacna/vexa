@@ -8,12 +8,11 @@
 // the gate runs `node scripts/check-isolation.js`.
 const { readFileSync, readdirSync } = require("node:fs");
 const { join, relative } = require("node:path");
-const { builtinModules } = require("node:module");
+const { isBuiltin } = require("node:module");
 
 const SRC = join(__dirname, "..", "src");
 const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8"));
 const deps = new Set([...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devDependencies || {})]);
-const builtins = new Set(builtinModules);
 let files = 0;
 const violations = [];
 (function walk(d) {
@@ -28,7 +27,7 @@ const violations = [];
         if (spec.startsWith(".")) continue;                 // intra-package
         const bare = spec.startsWith("node:") ? spec.slice(5) : spec;   // node:fs ≡ fs
         const scoped = bare.startsWith("@") ? bare.split("/").slice(0, 2).join("/") : bare.split("/")[0];
-        if (builtins.has(bare) || builtins.has(scoped)) continue;       // Node builtin (± node: prefix)
+        if (isBuiltin(spec)) continue;       // Exact Node builtin, including prefix-only modules.
         if (deps.has(spec) || deps.has(bare) || deps.has(scoped)) continue;  // declared dep
         violations.push(`${relative(SRC, p)} → ${spec}`);
       }

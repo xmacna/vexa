@@ -9,14 +9,13 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { builtinModules } from "node:module";
+import { isBuiltin } from "node:module";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, "..");
 const SRC = join(ROOT, "src");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 const deps = new Set([...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devDependencies || {})]);
-const builtins = new Set(builtinModules);
 let files = 0;
 const violations = [];
 (function walk(d) {
@@ -32,7 +31,7 @@ const violations = [];
         if (spec.startsWith(".") || spec.startsWith("@/")) continue;    // intra-package (relative or @/* alias)
         const bare = spec.startsWith("node:") ? spec.slice(5) : spec;
         const scoped = bare.startsWith("@") ? bare.split("/").slice(0, 2).join("/") : bare.split("/")[0];
-        if (builtins.has(bare) || builtins.has(scoped)) continue;       // builtin (± node: prefix)
+        if (isBuiltin(spec)) continue;       // Exact Node builtin, including prefix-only modules.
         if (deps.has(spec) || deps.has(bare) || deps.has(scoped)) continue;  // declared dep
         violations.push(`${relative(SRC, p)} → ${spec}`);
       }
