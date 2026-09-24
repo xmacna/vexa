@@ -5,8 +5,8 @@ works only through the ``claude`` CLI, not the raw HTTP APIs — so this adapter
 card beats (plain completions) run on the same credentials as the harness, with no API key.
 Select with ``VEXA_LLM_PROVIDER=claude-cli``.
 
-One ``claude -p <prompt> --output-format json`` per completion, TOOL-LESS (``--allowedTools ""``
-is verified deny-all) and run from a NEUTRAL cwd — a beat must never load workspace project
+One ``claude -p <prompt> --output-format json`` per completion, TOOL-LESS (``--tools ""`` removes
+every built-in tool from the request) and run from a NEUTRAL cwd — a beat must never load workspace project
 memory; steering lives exclusively in the prompt. Slower than a raw HTTP completion (CLI startup
 per call); prefer ``openai-compat``/``anthropic`` when an API-style credential exists.
 """
@@ -34,7 +34,7 @@ def _run_subprocess(argv: list[str], cwd: str, timeout: float) -> tuple[int, str
 def build_argv(prompt: str, *, system: Optional[str] = None, model: Optional[str] = None) -> list[str]:
     """Tool-less headless completion argv. ``--output-format json`` → one terminal JSON object
     (``result`` + ``is_error``); no ``--model`` when empty ⇒ the subscription default."""
-    argv = ["claude", "-p", prompt, "--output-format", "json", "--allowedTools", ""]
+    argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", ""]
     if system:
         argv += ["--append-system-prompt", system]
     if model:

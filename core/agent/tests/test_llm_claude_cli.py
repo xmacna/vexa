@@ -23,7 +23,7 @@ def test_argv_is_tool_less_json_with_optional_model_and_system():
     argv = build_argv("polish these lines", system="you are a copilot", model="m1")
     assert argv[:3] == ["claude", "-p", "polish these lines"]
     assert argv[argv.index("--output-format") + 1] == "json"
-    assert argv[argv.index("--allowedTools") + 1] == ""  # verified deny-all — a beat runs NO tools
+    assert argv[argv.index("--tools") + 1] == ""  # no tool definitions at all — a beat runs NO tools
     assert argv[argv.index("--append-system-prompt") + 1] == "you are a copilot"
     assert argv[argv.index("--model") + 1] == "m1"
     # empty model ⇒ no --model flag (the subscription default decides)

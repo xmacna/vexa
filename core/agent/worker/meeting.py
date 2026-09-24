@@ -70,7 +70,7 @@ _CARD_FRAME = (
     "literal section title.\n\n"
     "## Tag rules (governed by this workspace)\n{tags}\n\n"
     "Emit tags ONLY as cards of these kinds: {kinds}. Do not use any other kind.\n\n"
-    "Respond with ONLY this JSON object (no prose, no markdown fence, and do NOT write any files):\n"
+    "Respond with ONLY this JSON object (no prose, no markdown fence):\n"
     "{{\"notes\":[{{\"id\":\"<input id>\",\"speaker\":\"<speaker>\",\"chapter\":\"\",\"text\":\"<clean one-line note>\"}}],"
     "\"cards\":[{{\"kind\":\"<one of {kinds}>\",\"title\":\"<short>\",\"body\":\"<one line>\",\"actionable\":true}}]}}\n"
     "Use an empty cards array if these specific lines add no tags.{steering}"
@@ -634,11 +634,11 @@ _CARD_GROUP = {  # card kind → the section it lands under in the doc
 }
 
 MEETING_DOC_PROMPT = (
-    "The meeting has ENDED. Author or update the knowledge-graph entity for it as a SINGLE markdown "
-    "file at the EXACT path `kg/entities/meeting/{native}.md` in this workspace (create parent dirs if "
-    "needed). This must be IDEMPOTENT — if the file already exists, UPDATE it in place (do not create a "
-    "duplicate or a new path).\n\n"
-    "The file MUST have this exact YAML frontmatter (between `---` fences) as the very first lines:\n"
+    "The meeting has ended. Author or update the knowledge-graph entity for it as one markdown file at "
+    "`kg/entities/meeting/{native}.md` in this workspace (create parent dirs if needed); the meeting page "
+    "reads that exact path, so if the file already exists, update it in place rather than creating a "
+    "new one.\n\n"
+    "Start the file with this YAML frontmatter (between `---` fences), which the meeting page parses:\n"
     "---\n"
     "type: meeting\n"
     "id: {native}\n"
@@ -652,7 +652,7 @@ MEETING_DOC_PROMPT = (
     "distilled summary), then the surfaced entities grouped under `## Attendees`, `## Companies`, "
     "`## Topics`, `## Decisions`, `## Actions` headings, each entry a `[[wikilink]]` (omit a heading if "
     "it has no entries). Here are the entities surfaced during the meeting (JSON):\n\n{cards}\n\n"
-    "Do NOT copy the raw transcript. When done, write/edit ONLY that one file."
+    "Leave the raw transcript out. Write or edit only that one file."
 )
 
 
